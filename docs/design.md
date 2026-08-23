@@ -204,3 +204,11 @@ apply:
 5. **投影現已真正生效**:正確契約(`stateSchema`+`wire`)下,`session_projcache.json` 已出現 `skillLedger` 行,客戶端 `useProjection('skillLedger')` 可讀(對照:dsh-goal 同款寫法)。
 6. **熱插件階段與舊 trail 並存**:`conversation.chat.turnTail` 鏈條同時有 `skill-trail-client`(靜態)與 `dyn/sklg-3`(動態),產生兩套徽章——屬預期,靜態包化時移除舊行即收斂。
 7. **審查修復(獨立子代理評審 1 Blocker + 3 Major + 若干 Minor,已全部處理)**:React hooks 順序違規(useEffect 移早於早退)、客戶端/宿主 skill 名解析雙鍵統一(name/skill)、原型污染防護(桶用 Object.create(null)+hasOwnProperty)、SkillsView 缺省守衛、RPC error 展示、分析折疊不重複調用、服務引用移入 handler、配對回退僅限唯一 pending、`lastErrTurn` 上報、stateSchema 數組守衛。餘下 Minor/Nit(配置項、快取、truncated 標記)記錄為靜態包化階段收斂項。
+
+### §11.1 v3 雙席位修復(2026-08-23)
+
+**現象**:產物卡出現的輪次,徽章消失。**根因**:`conversation.chat.turnTail` 是單赢家鏈(dsh-client-ui-renderer 鏈渲染:第一個 select 非 null 的 entry 獨占,break)——官方 deliverables 條目在產檔輪先聲明即當選,徽章條目永遠輪不到;編碼會話幾乎每輪產檔。
+
+**修復(雙席位)**:保留鏈席位(無產檔輪直接渲染完整徽章);新增 `conversation.chat.assistant-actions` 列表席位(list 槽所有條目並存)——緊湊芯片 `🧩 N技能/M工具`,點擊彈出完整徽章區+候補行。messageId→turn 映射經快照 assistant 節點(`messageId`+`turn`),邊界用 `snapshot.turnEnds`(窗口內已完成輪)。
+
+**轉正**:熱插件 sklg-3 已從面板存儲移除;profile bundles 以 `@bryan-cmf/dsh-skill-ledger` 替換 trail+gate 兩行;行級 inject(加載器讀行選項,非模組導出——gate 當年靜默失效、ops-view 拖垮整樹的兩個教訓)。
