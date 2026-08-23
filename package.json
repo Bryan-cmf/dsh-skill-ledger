@@ -1,0 +1,69 @@
+{
+  "name": "@bryan-cmf/dsh-skill-ledger",
+  "description": "DSH-Plugin: skill ledger — per-reply skill badges + non-blocking alternative-skill hint row + a Skills tab (session-wide ledger with capability/quality analysis buttons); folds tool/call+tool/result into a correctly-wired skillLedger projection.",
+  "version": "0.1.0-alpha.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "docs"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "cordis-plugin",
+    "skill",
+    "observability",
+    "agent-infrastructure"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "clean": "rm -rf lib",
+    "types": "tsc -p tsconfig.json",
+    "bundle": "tsdown",
+    "build": "pnpm clean && pnpm types && pnpm bundle",
+    "prepublishOnly": "pnpm build"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^18.3.1",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.8.0"
+  }
+}

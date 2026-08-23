@@ -1,0 +1,10 @@
+# @bryan-cmf/dsh-skill-ledger — bundle patch layer.
+#
+# When this package is listed in a profile's `dsh.profile.bundles`, this patch
+# inserts the plugin row into the composed profile tree (the same mechanism
+# the shipped @deepseek-ai/dsh-base and @deepseek-ai/dsh-web-app bundles use).
+# Consumer-only row (registers a projection unit, two webServer routes and
+# turnTail/view UI; publishes no service), so it sits loose — no isolate realm.
+- insert:
+    - id: skill-ledger
+      name: '@bryan-cmf/dsh-skill-ledger'
