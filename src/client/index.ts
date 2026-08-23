@@ -157,13 +157,24 @@ function deriveTrail(snapshot: SnapshotLike | undefined, turn: TurnLocationLike)
   return trailFromNodes(snapshot.nodes, startSeq, endSeq)
 }
 
-/** Actions-seat path: boundaries from the snapshot's completed-turn index. */
+/** Actions-seat path: boundaries from the snapshot's completed-turn index.
+ * Turn boundaries are monotonically increasing, so the start boundary is the
+ * largest known turn-end strictly below this turn's end (that is turn N-1's
+ * end when it is in-window). Falling back to -1 when N-1's end is missing
+ * (window truncation on old sessions) would swallow EVERY earlier in-window
+ * turn's tools into this one — the conservative bound prevents that. */
 function deriveTrailByNumber(snapshot: SnapshotLike | undefined, turnNo: number): Trail | undefined {
   if (!snapshot) return undefined
   const ends = snapshot.turnEnds
-  const startSeq = turnNo > 1 ? ends?.get(turnNo - 1) ?? -1 : -1
-  const endSeq = ends?.get(turnNo) ?? Number.MAX_SAFE_INTEGER
-  return trailFromNodes(snapshot.nodes, startSeq, endSeq)
+  const endRaw = ends?.get(turnNo)
+  const end = typeof endRaw === 'number' ? endRaw : Number.MAX_SAFE_INTEGER
+  let start = -1
+  if (ends !== undefined) {
+    for (const [t, s] of ends) {
+      if (t !== turnNo && typeof s === 'number' && s < end && s > start) start = s
+    }
+  }
+  return trailFromNodes(snapshot.nodes, start, end)
 }
 
 /** The closing assistant's messageId → its turn number (assistant nodes carry both). */
