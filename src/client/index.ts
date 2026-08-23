@@ -7,15 +7,22 @@
  *    "re-run with selected skills" button that writes a prompt draft — the
  *    user stays in full control, nothing is ever intercepted).
  *
+ * A2) `conversation.chat.assistant-actions` list entry: a compact per-turn
+ *    chip (🧩 技能×N·工具×M) that expands a popover with the SAME badge rows
+ *    and hint row. Why a second seat: the turnTail slot is a CHAIN — the
+ *    first entry whose select returns non-null wins and nothing else renders.
+ *    The shipped deliverables entry claims every turn that produced files, so
+ *    on those turns (most coding turns) the chain seat never reaches us. The
+ *    actions slot is a LIST — every entry renders, so the chip coexists with
+ *    the deliverables card and badges stay reachable under every reply.
+ *
  * B) `conversation.view` list entry (id 'skills', order 60, label 技能): a
  *    Skills tab over the whole session — per-skill ledger stats from the
  *    host projection (`useProjection('skillLedger')`) plus capability/quality
- *    analysis buttons:
- *      ⚙ 分析能力/質量  → POST /api/skill-ledger/analyze, inline report
- *      🔬 深度分析       → writes a skill-analysis prompt draft
+ *    analysis buttons.
  *
- * React hooks are called unconditionally at the component top (the effect
- * runs before any early return) — a hard rule this component family enforces
+ * React hooks are called unconditionally at each component's top (effects run
+ * before any early return) — a hard rule this component family enforces
  * after a past hooks-order regression.
  */
 import { createElement, useEffect, useState, type CSSProperties, type ReactNode } from 'react'
@@ -38,14 +45,25 @@ interface ToolResultNodeLike {
   call?: { name: string; argsRaw: string } | null
   isError: boolean
 }
+interface AssistantNodeLike {
+  kind: 'assistant'
+  messageId?: string
+  turn?: number
+}
 interface SnapshotLike {
-  nodes?: ToolResultNodeLike[]
+  nodes?: (ToolResultNodeLike | AssistantNodeLike)[]
+  turnEnds?: ReadonlyMap<number, number>
 }
 interface InputActionsLike {
   setDraft?: (text: string) => void
 }
 interface TurnTailProps {
   matched?: TurnLocationLike | null
+  useSession?: <S>(selector: (snapshot: SnapshotLike) => S) => S
+  inputActions?: InputActionsLike
+}
+interface AssistantActionsProps {
+  messageId?: string
   useSession?: <S>(selector: (snapshot: SnapshotLike) => S) => S
   inputActions?: InputActionsLike
 }
@@ -81,13 +99,19 @@ const statValue: CSSProperties = { fontSize: 20, fontWeight: 700 }
 const statLabel: CSSProperties = { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' }
 const reportBodyStyle: CSSProperties = { marginTop: 6, fontSize: 11, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.6, background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 6, padding: '6px 9px' }
 const rerunBtn: CSSProperties = { borderRadius: 8, border: '1px solid var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-brand-primary)', background: 'transparent', padding: '3px 10px', fontSize: 11, cursor: 'pointer' }
+const summaryChipBtn: CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '1px 7px', borderRadius: 999, background: 'transparent', color: 'var(--dsw-alias-label-tertiary)', border: '1px solid var(--dsw-alias-border-l1)', whiteSpace: 'nowrap', fontSize: 11, lineHeight: 1.4, cursor: 'pointer', fontFamily: 'inherit' }
+const popoverAnchor: CSSProperties = { position: 'relative', display: 'inline-flex', flex: 'none' }
+const popoverStyle: CSSProperties = { position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 30, minWidth: 280, maxWidth: 480, background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 10, boxShadow: 'var(--dsw-shadow-lv3)', padding: '4px 6px' }
 
-// ── snapshot trail derivation (pillar A) ────────────────────────────────────
+// ── trail derivation ────────────────────────────────────────────────────────
 
 interface TrailCall {
   name: string
   skill: string
   status: 'ok' | 'err'
+}
+interface Trail {
+  triggered: TrailCall[]
 }
 
 /** Unified argument parsing: `name` first, `skill` fallback (host does the same). */
@@ -106,28 +130,63 @@ function skillNameOf(argsRaw: string | undefined): string {
   return ''
 }
 
-/** One turn's trail from the local conversation snapshot (in-window only). */
-function deriveTrail(snapshot: SnapshotLike | undefined, turn: TurnLocationLike): { triggered: TrailCall[] } | undefined {
-  if (!snapshot || !turn) return undefined
-  const startSeq = turn.start && typeof turn.start.seq === 'number' ? turn.start.seq : -1
-  const endSeq = turn.end && typeof turn.end.seq === 'number' ? turn.end.seq : Number.MAX_SAFE_INTEGER
+function trailFromNodes(nodes: (ToolResultNodeLike | AssistantNodeLike)[] | undefined, startSeq: number, endSeq: number): Trail | undefined {
   const triggered: TrailCall[] = []
-  const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : []
-  for (const node of nodes) {
-    if (!node || node.kind !== 'tool-result') continue
-    const seq = typeof node.seq === 'number' ? node.seq : -1
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (!node || (node as ToolResultNodeLike).kind !== 'tool-result') continue
+    const tr = node as ToolResultNodeLike
+    const seq = typeof tr.seq === 'number' ? tr.seq : -1
     if (seq <= startSeq || seq > endSeq) continue
-    const name = node.call && typeof node.call.name === 'string' ? node.call.name : ''
+    const name = tr.call && typeof tr.call.name === 'string' ? tr.call.name : ''
     if (name === '') continue
     triggered.push({
       name,
-      skill: name === 'skill' ? skillNameOf(node.call ? node.call.argsRaw : undefined) : '',
-      status: node.isError === true ? 'err' : 'ok',
+      skill: name === 'skill' ? skillNameOf(tr.call ? tr.call.argsRaw : undefined) : '',
+      status: tr.isError === true ? 'err' : 'ok',
     })
   }
   if (triggered.length === 0) return undefined
   return { triggered }
 }
+
+/** Chain-seat path: boundaries from the engine-owned TurnLocation. */
+function deriveTrail(snapshot: SnapshotLike | undefined, turn: TurnLocationLike): Trail | undefined {
+  if (!snapshot || !turn) return undefined
+  const startSeq = turn.start && typeof turn.start.seq === 'number' ? turn.start.seq : -1
+  const endSeq = turn.end && typeof turn.end.seq === 'number' ? turn.end.seq : Number.MAX_SAFE_INTEGER
+  return trailFromNodes(snapshot.nodes, startSeq, endSeq)
+}
+
+/** Actions-seat path: boundaries from the snapshot's completed-turn index. */
+function deriveTrailByNumber(snapshot: SnapshotLike | undefined, turnNo: number): Trail | undefined {
+  if (!snapshot) return undefined
+  const ends = snapshot.turnEnds
+  const startSeq = turnNo > 1 ? ends?.get(turnNo - 1) ?? -1 : -1
+  const endSeq = ends?.get(turnNo) ?? Number.MAX_SAFE_INTEGER
+  return trailFromNodes(snapshot.nodes, startSeq, endSeq)
+}
+
+/** The closing assistant's messageId → its turn number (assistant nodes carry both). */
+function turnOfMessage(snapshot: SnapshotLike | undefined, messageId: string | undefined): number | undefined {
+  if (!snapshot || messageId === undefined) return undefined
+  for (const node of Array.isArray(snapshot.nodes) ? snapshot.nodes : []) {
+    const a = node as AssistantNodeLike
+    if (a && a.kind === 'assistant' && a.messageId === messageId) {
+      return typeof a.turn === 'number' ? a.turn : undefined
+    }
+  }
+  return undefined
+}
+
+function skillNamesOf(trail: Trail): string[] {
+  const names: string[] = []
+  for (const c of trail.triggered) {
+    if (c.skill !== '' && !names.includes(c.skill)) names.push(c.skill)
+  }
+  return names
+}
+
+// ── badge rows + hint row (shared by both seats) ────────────────────────────
 
 interface Chip {
   key: string
@@ -135,7 +194,7 @@ interface Chip {
   kind: 'plain' | 'skill' | 'ok' | 'err'
 }
 
-function chipsOf(trail: { triggered: TrailCall[] }, isSkill: boolean): Chip[] {
+function chipsOf(trail: Trail, isSkill: boolean): Chip[] {
   const byKey: Record<string, { count: number; ok: number; err: number }> = Object.create(null)
   for (const c of trail.triggered) {
     const is = c.skill !== ''
@@ -172,25 +231,22 @@ function renderRow(label: string, chips: Chip[]): ReactNode {
   )
 }
 
-// ── pillar A + B: badges + alternative-skill hint row ──────────────────────
+function BadgeRows({ entry }: { entry: Trail }): ReactNode {
+  const rows: ReactNode[] = []
+  const skillChips = chipsOf(entry, true)
+  const toolChips = chipsOf(entry, false)
+  if (skillChips.length > 0) rows.push(renderRow('技能 Skills', skillChips))
+  if (toolChips.length > 0) rows.push(renderRow('工具 Tools', toolChips))
+  return createElement('div', { style: containerStyle }, rows)
+}
 
-function TurnTail(props: TurnTailProps): ReactNode {
+/** Pillar B: the non-blocking alternative-skill hint row (own state/effect). */
+function HintRow({ skillNames, inputActions }: { skillNames: string[]; inputActions?: InputActionsLike }): ReactNode {
   const [cand, setCand] = useState<SkillCandidate[] | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
-  const turn = props.matched
-  const snapshot = props.useSession ? props.useSession((s) => s) : undefined
-  const entry = turn ? deriveTrail(snapshot, turn) : undefined
-  const skillNames: string[] = []
-  if (entry) {
-    for (const c of entry.triggered) {
-      if (c.skill !== '' && !skillNames.includes(c.skill)) skillNames.push(c.skill)
-    }
-  }
-  const showHint = entry !== undefined && skillNames.length > 0
   const skillKey = skillNames.join(',')
-  // Hooks run unconditionally BEFORE the early return below — never conditional.
   useEffect(() => {
-    if (!showHint) {
+    if (skillNames.length === 0) {
       setCand(null)
       setSelected({})
       return
@@ -205,27 +261,21 @@ function TurnTail(props: TurnTailProps): ReactNode {
       })
       .catch(() => { if (!cancelled) setCand([]) })
     return () => { cancelled = true }
-  }, [showHint, skillKey])
+  }, [skillKey, skillNames.length])
 
-  if (!entry) return null
+  if (skillNames.length === 0) return null
   const chosen = Object.keys(selected).filter((k) => selected[k])
   function rerun(): void {
     if (chosen.length === 0) return
-    if (!props.inputActions || typeof props.inputActions.setDraft !== 'function') return
-    props.inputActions.setDraft(
+    if (!inputActions || typeof inputActions.setDraft !== 'function') return
+    inputActions.setDraft(
       `請使用技能 ${chosen.join('、')} 重新處理上一輪任務(該輪使用了 ${skillNames.join('、')})。若你對前輪結果有不滿意的具體點,可在此補充說明。`,
     )
   }
-
-  const rows: ReactNode[] = []
-  const skillChips = chipsOf(entry, true)
-  const toolChips = chipsOf(entry, false)
-  if (skillChips.length > 0) rows.push(renderRow('技能', skillChips))
-  if (toolChips.length > 0) rows.push(renderRow('工具', toolChips))
-  let hintRow: ReactNode = null
-  if (showHint) {
-    const list = cand === null ? [] : cand
-    const hintChips = list.map((s) => createElement('span', {
+  const list = cand === null ? [] : cand
+  return createElement('div', { style: rowStyle },
+    createElement('span', { style: capStyle }, '不滿意?可試 Alt'),
+    list.map((s) => createElement('span', {
       key: s.name,
       style: {
         ...chipBase,
@@ -235,15 +285,50 @@ function TurnTail(props: TurnTailProps): ReactNode {
       },
       title: s.description || '',
       onClick: () => { setSelected({ ...selected, [s.name]: !selected[s.name] }) },
-    }, (selected[s.name] ? '✓ ' : '') + s.name))
-    hintRow = createElement('div', { style: rowStyle },
-      createElement('span', { style: capStyle }, '不滿意?可試'),
-      hintChips,
-      cand === null ? createElement('span', { style: { ...chipBase, opacity: 0.6 } }, '…') : null,
-      chosen.length > 0 ? createElement('button', { style: rerunBtn, onClick: rerun }, '用選定技能重跑') : null,
-    )
-  }
-  return createElement('div', { style: containerStyle }, rows, hintRow)
+    }, (selected[s.name] ? '✓ ' : '') + s.name)),
+    cand === null ? createElement('span', { style: { ...chipBase, opacity: 0.6 } }, '…') : null,
+    chosen.length > 0 ? createElement('button', { style: rerunBtn, onClick: rerun }, '用選定技能重跑') : null,
+  )
+}
+
+// ── seat 1: the turnTail chain entry ────────────────────────────────────────
+
+function TurnTail(props: TurnTailProps): ReactNode {
+  const turn = props.matched
+  const snapshot = props.useSession ? props.useSession((s) => s) : undefined
+  const entry = turn ? deriveTrail(snapshot, turn) : undefined
+  if (!entry) return null
+  const skillNames = skillNamesOf(entry)
+  return createElement('div', { style: containerStyle },
+    createElement(BadgeRows, { entry }),
+    createElement(HintRow, { skillNames, inputActions: props.inputActions }),
+  )
+}
+
+// ── seat 2: the assistant-actions list entry (coexists with deliverables) ───
+
+function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
+  const [open, setOpen] = useState(false)
+  const snapshot = props.useSession ? props.useSession((s) => s) : undefined
+  const turnNo = turnOfMessage(snapshot, props.messageId)
+  const entry = turnNo !== undefined ? deriveTrailByNumber(snapshot, turnNo) : undefined
+  if (!entry) return null
+  const skillChips = chipsOf(entry, true)
+  const toolChips = chipsOf(entry, false)
+  const label = `🧩 ${skillChips.length}技能/${toolChips.length}工具`
+  const chip = createElement('button', {
+    style: { ...summaryChipBtn, ...(open ? { color: 'var(--dsw-alias-brand-primary)', borderColor: 'var(--dsw-alias-brand-primary)' } : {}) },
+    title: '本輪技能/工具徽章',
+    onClick: () => { setOpen(!open) },
+  }, label + (open ? ' ▾' : ' ▸'))
+  if (!open) return createElement('span', { style: popoverAnchor }, chip)
+  return createElement('span', { style: popoverAnchor },
+    chip,
+    createElement('div', { style: popoverStyle },
+      createElement(BadgeRows, { entry }),
+      createElement(HintRow, { skillNames: skillNamesOf(entry), inputActions: props.inputActions }),
+    ),
+  )
 }
 
 // ── pillar C: the Skills tab ────────────────────────────────────────────────
@@ -285,16 +370,16 @@ function SkillsView(props: ViewProps): ReactNode {
   }
 
   const header = createElement('div', { style: cardStyle },
-    createElement('div', { style: cardTitle }, '技能台帳'),
+    createElement('div', { style: cardTitle }, '技能台帳 Skill Ledger'),
     reg === null
       ? createElement('div', { style: { color: 'var(--dsw-alias-label-secondary)' } }, '等待宿主投影數據…')
       : createElement('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap' } },
           createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-            createElement('span', { style: statValue }, String(total.skills)), createElement('span', { style: statLabel }, '技能數')),
+            createElement('span', { style: statValue }, String(total.skills)), createElement('span', { style: statLabel }, '技能數 Skills')),
           createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-            createElement('span', { style: statValue }, String(total.calls)), createElement('span', { style: statLabel }, '技能調用')),
+            createElement('span', { style: statValue }, String(total.calls)), createElement('span', { style: statLabel }, '技能調用 Calls')),
           createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-            createElement('span', { style: statValue }, String(Object.keys(toolsMap).length)), createElement('span', { style: statLabel }, '工具種類')),
+            createElement('span', { style: statValue }, String(Object.keys(toolsMap).length)), createElement('span', { style: statLabel }, '工具種類 Tools')),
         ))
 
   const cards = skillNames.map((skill) => {
@@ -351,10 +436,21 @@ function SkillsView(props: ViewProps): ReactNode {
 }
 
 function apply(ctx: ClientCtx): void {
+  // Seat 1 — the chain: full badge row under replies on turns the chain
+  // reaches (i.e. when no earlier entry — the shipped deliverables card —
+  // claimed the turn).
   ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register(
     { name: 'conversation.chat.turnTail', select: (owner: { turn?: unknown }) => (owner && owner.turn ? owner.turn : null) },
     TurnTail,
   ))
+  // Seat 2 — the actions list: a compact summary chip on EVERY completed
+  // turn's action row (list semantics — coexists with the deliverables card
+  // that wins the chain on file-producing turns).
+  ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register(
+    { name: 'conversation.chat.assistant-actions', id: 'skill-ledger', order: 100, label: '技能徽章' },
+    AssistantActionsBadge,
+  ))
+  // Pillar C — the Skills tab.
   ctx.slots.inject('conversation.view', () => ctx.slots.register(
     { name: 'conversation.view', id: 'skills', order: 60, label: '技能' },
     SkillsView,

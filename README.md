@@ -1,6 +1,8 @@
 # 🧩 Skill Ledger — DSH-Plugin
 
-> **技能看得見、選得出、析得動。** 每條回覆下方的技能/工具徽章 + 非阻斷候選技能提示 + 會話級「技能」標籤頁(台帳與能力/質量分析)。
+> **Skills you can see, switch, and analyze.** Per-reply skill badges + a non-blocking alternative-skill hint + a session-wide Skills tab (ledger with capability/quality analysis).
+
+**[English](README.md) · [繁體中文](README.zh.md)**
 
 [![npm](https://img.shields.io/npm/v/@bryan-cmf/dsh-skill-ledger)](https://www.npmjs.com/package/@bryan-cmf/dsh-skill-ledger)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -12,32 +14,42 @@ that turns skills into a first-class observable surface. Three pillars:
 
 ## ✨ Features
 
-### A — Per-reply badges (`conversation.chat.turnTail`)
+### A — Per-reply badges, on every turn (dual-seat)
 
 Beneath every completed reply, the skills the turn triggered (🧠) and the tools
 it actually used (✓) or failed (✗), aggregated with counts:
 
 ```
-🧩 技能   [🧠 ak-hk-stock-dd ✓] [🧠 serenity-skill ✗]
-🧩 工具   [read ×3 ✓] [bash ✗]
+🧩 Skills  [🧠 ak-hk-stock-dd ✓] [🧠 serenity-skill ✗]
+🧩 Tools   [read ×3 ✓] [bash ✗]
 ```
 
-Derived from the conversation snapshot's `tool-result` nodes — deterministic
-for live turns and replayed history, zero model self-reporting. Tool-less
-turns render nothing.
+The badges render through **two cooperating seats**, because the turn-tail
+slot is a *chain* with single-winner semantics — the shipped deliverables
+card claims every turn that produced files, and a chain elects exactly one
+entry:
 
-### B — Non-blocking alternative-skill hint (same slot)
+1. **`conversation.chat.turnTail` (chain seat)** — the full badge block +
+   hint row, rendered directly on turns the chain reaches (no files produced);
+2. **`conversation.chat.assistant-actions` (list seat)** — a compact
+   `🧩 N skills/M tools` chip on EVERY completed turn's action row (list slots
+   render all entries, so it coexists with the deliverables card). Click it
+   to expand a popover with the same full badge block + hint row.
 
-When a turn used at least one skill, a third row appears:
+Result: badges are reachable under every reply, file-producing or not, without
+ever shadowing the shipped deliverables UI.
+
+### B — Non-blocking alternative-skill hint
+
+When a turn used at least one skill, the hint row appears:
 
 ```
-🧩 不滿意?可試  [serenity-skill] [dcf-valuation] [ak-financial-analyst]  [用選定技能重跑]
+🧩 Not happy? Try   [serenity-skill] [dcf-valuation] [ak-financial-analyst]  [Re-run with selected]
 ```
 
 Multi-select candidate chips → the button writes a re-run prompt **draft** into
 the composer. Nothing is ever intercepted, popped, or timed out — you press
-Enter, or you don't. (This is the philosophical opposite of a blocking
-"skill gate".)
+Enter, or you don't. (The philosophical opposite of a blocking "skill gate".)
 
 ### C — The Skills tab (`conversation.view`, id `skills`)
 
@@ -46,11 +58,10 @@ ok / err / turns / last-failing turn) backed by the **`skillLedger` session
 projection** (whole session, including out-of-window turns and cold-start
 backfill), plus two analysis affordances per skill:
 
-- **⚙ 分析能力/質量** — instant structural report via
+- **⚙ capability/quality analysis** — instant structural report via
   `POST /api/skill-ledger/analyze` (folded stats + catalog definition digest);
-- **🔬 深度分析** — writes a prompt draft that dispatches the
-  [`skill-analysis`](https://github.com/Bryan-cmf) skill for a source-level
-  capability/quality review.
+- **🔬 deep analysis** — writes a prompt draft that dispatches a
+  `skill-analysis` skill for a source-level capability/quality review.
 
 ## Why the projection is trustworthy
 
@@ -84,15 +95,21 @@ then install (`dsh plugin --profile <name> install`) and restart DSH.
 ```yaml
 - id: skill-ledger
   name: '@bryan-cmf/dsh-skill-ledger'
+  inject: [sessionProjections, webServer, skills, sessions]
 ```
+
+> ⚠️ Keep `inject` in the **row** (or bundle patch): the DSH loader reads the
+> dependency list from row options, not from the module export. The
+> module-export form is how `dsh-skill-gate` silently never activated; the
+> missing form is how `dsh-ops-view` 0.2.0 failed the whole tree.
 
 ## Requirements
 
 - DSH `>= 0.1.0-rc.6` — services `sessionProjections`, `webServer`, `skills`,
-  `sessions` (all shipped in the `dsh-base` bundle; the plugin declares them
-  as hard `inject` dependencies and waits for them)
-- Browser UI needs the `conversation.chat.turnTail` chain and the
-  `conversation.view` ring (shipped chat view)
+  `sessions` (all shipped in the `dsh-base` bundle)
+- Browser UI needs the `conversation.chat.turnTail` chain,
+  `conversation.chat.assistant-actions` list and the `conversation.view` ring
+  (shipped chat view)
 
 ## Configuration
 
@@ -113,7 +130,8 @@ Both are fail-soft: errors return `{error}` with HTTP 200, never 5xx.
 
 [`docs/design.md`](docs/design.md) records the full review that led here —
 including the autopsy of the two predecessors this package replaces
-(`dsh-skill-trail`, `dsh-skill-gate`) and the hot-plugin validation round.
+(`dsh-skill-trail`, `dsh-skill-gate`), the hot-plugin validation round, and
+the dual-seat fix for the chain/deliverables conflict.
 
 ## Development
 

@@ -3,8 +3,19 @@
 # When this package is listed in a profile's `dsh.profile.bundles`, this patch
 # inserts the plugin row into the composed profile tree (the same mechanism
 # the shipped @deepseek-ai/dsh-base and @deepseek-ai/dsh-web-app bundles use).
-# Consumer-only row (registers a projection unit, two webServer routes and
-# turnTail/view UI; publishes no service), so it sits loose — no isolate realm.
+#
+# The row is consumer-only (registers a projection unit, two webServer routes
+# and turnTail/actions/view UI; publishes no service), so it sits loose — no
+# isolate realm. `inject` MUST live here in the row: the DSH loader reads the
+# dependency list from the row options, NOT from the module export (the
+# module-export form is how dsh-skill-gate silently never activated, and the
+# missing form is how dsh-ops-view 0.2.0 failed the whole tree with
+# "cannot get property webServer without inject").
 - insert:
     - id: skill-ledger
       name: '@bryan-cmf/dsh-skill-ledger'
+      inject:
+        - sessionProjections
+        - webServer
+        - skills
+        - sessions
