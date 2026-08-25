@@ -308,11 +308,17 @@ function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]
   const list = cand === null ? [] : cand
   return createElement('div', { style: rowStyle },
     createElement('span', { style: capStyle }, '不滿意?可試 Alt'),
-    list.map((s) => createElement('span', {
+    // Candidate chips are real toggle buttons: keyboard focusable, Enter/Space
+    // activatable, and aria-pressed carries the selection state to assistive
+    // tech (a span+onClick would be invisible to both).
+    list.map((s) => createElement('button', {
       key: s.name,
+      type: 'button',
+      'aria-pressed': selected[s.name] === true,
       style: {
         ...chipBase,
         cursor: 'pointer',
+        fontFamily: 'inherit',
         borderColor: selected[s.name] ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)',
         color: selected[s.name] ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)',
       },
@@ -368,6 +374,8 @@ function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
   const toolChips = chipsOf(entry, false)
   const label = `🧩 ${skillChips.length}技能/${toolChips.length}工具`
   const chip = createElement('button', {
+    type: 'button',
+    'aria-expanded': open,
     style: { ...summaryChipBtn, ...(open ? { color: 'var(--dsw-alias-brand-primary)', borderColor: 'var(--dsw-alias-brand-primary)' } : {}) },
     title: '本輪技能/工具徽章',
     onClick: () => { setOpen(!open) },
