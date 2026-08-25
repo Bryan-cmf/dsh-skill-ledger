@@ -30,7 +30,7 @@ const MAX_CALLS_PER_TURN = 60
 const MAX_CANDIDATES = 12
 
 /** Hard dependencies — all shipped in the dsh-base bundle. */
-const inject = ['sessionProjections', 'webServer', 'skills', 'sessions']
+const inject = ['sessionProjections', 'webServer', 'skills', 'sessions', 'agents']
 
 // ── minimal structural shapes (no runtime imports from @deepseek-ai/*) ──────
 
@@ -86,6 +86,10 @@ interface SkillsService {
 interface SessionsService {
   get(id: string): unknown
 }
+interface AgentsService {
+  /** Agent and Session share the same id axis. */
+  get(id: string): { session: { header: { cwd?: unknown } } } | undefined
+}
 interface WebServerLike {
   register(route: {
     kind: string
@@ -98,6 +102,7 @@ interface HostCtx extends Record<string, unknown> {
   webServer: WebServerLike
   skills: SkillsService
   sessions: SessionsService
+  agents: AgentsService
 }
 
 // ── schema shims: the runtime only ever calls .parse on these ───────────────
@@ -263,6 +268,27 @@ function sendJson(res: ServerResponse, value: unknown): void {
   res.end(body)
 }
 
+/**
+ * Resolve the skills-view lookup for a session id. Skill catalogs are layered
+ * by scope and cwd (user-agents root, project roots, preset layers); calling
+ * list/get WITHOUT them sees only the global layer — empty on this deployment
+ * (verified live: candidates returned [] and get() returned undefined). The
+ * shipped skill tool passes { cwd, scope: agent }; we mirror that via the
+ * agents registry (Agent and Session share the id axis).
+ */
+function lookupOf(ctx: HostCtx, sessionId: string): Record<string, unknown> {
+  try {
+    const agent = ctx.agents.get(sessionId)
+    if (agent !== undefined) {
+      const cwd = agent.session.header.cwd
+      return { cwd: typeof cwd === 'string' ? cwd : undefined, scope: agent }
+    }
+  } catch {
+    // fall through to the cwd-less lookup
+  }
+  return {}
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const parts: Buffer[] = []
@@ -287,9 +313,12 @@ function apply(ctx: HostCtx): void {
   ctx.webServer.register({
     kind: 'exact',
     path: '/api/skill-ledger/candidates',
-    handler: async (_req, res) => {
+    handler: async (req, res) => {
       try {
-        const list = await ctx.skills.list({})
+        const url = new URL(req.url ?? '/', 'http://x')
+        const sid = url.searchParams.get('sessionId') ?? ''
+        const lookup = sid !== '' ? lookupOf(ctx, sid) : {}
+        const list = await ctx.skills.list(lookup)
         const arr: Array<{ name: string; description: string }> = []
         for (const s of Array.isArray(list) ? list : []) {
           if (!s || typeof s.name !== 'string' || s.name === '') continue
@@ -335,7 +364,7 @@ function apply(ctx: HostCtx): void {
           }
         }
         let definition: SkillDefinitionDigest | null = null
-        const d = await ctx.skills.get(skill, {})
+        const d = await ctx.skills.get(skill, lookupOf(ctx, sessionId))
         if (d !== undefined) {
           definition = {
             name: typeof d.name === 'string' ? d.name : skill,

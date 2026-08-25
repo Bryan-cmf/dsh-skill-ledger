@@ -59,11 +59,13 @@ interface InputActionsLike {
 }
 interface TurnTailProps {
   matched?: TurnLocationLike | null
+  sessionId?: string
   useSession?: <S>(selector: (snapshot: SnapshotLike) => S) => S
   inputActions?: InputActionsLike
 }
 interface AssistantActionsProps {
   messageId?: string
+  sessionId?: string
   useSession?: <S>(selector: (snapshot: SnapshotLike) => S) => S
   inputActions?: InputActionsLike
 }
@@ -252,7 +254,7 @@ function BadgeRows({ entry }: { entry: Trail }): ReactNode {
 }
 
 /** Pillar B: the non-blocking alternative-skill hint row (own state/effect). */
-function HintRow({ skillNames, inputActions }: { skillNames: string[]; inputActions?: InputActionsLike }): ReactNode {
+function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]; inputActions?: InputActionsLike; sessionId?: string }): ReactNode {
   const [cand, setCand] = useState<SkillCandidate[] | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
   const skillKey = skillNames.join(',')
@@ -263,7 +265,7 @@ function HintRow({ skillNames, inputActions }: { skillNames: string[]; inputActi
       return
     }
     let cancelled = false
-    fetch('/api/skill-ledger/candidates')
+    fetch(`/api/skill-ledger/candidates${typeof sessionId === 'string' && sessionId !== '' ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`)
       .then((r) => r.json())
       .then((res: { skills?: SkillCandidate[] }) => {
         if (cancelled) return
@@ -272,7 +274,7 @@ function HintRow({ skillNames, inputActions }: { skillNames: string[]; inputActi
       })
       .catch(() => { if (!cancelled) setCand([]) })
     return () => { cancelled = true }
-  }, [skillKey, skillNames.length])
+  }, [skillKey, skillNames.length, sessionId])
 
   if (skillNames.length === 0) return null
   const chosen = Object.keys(selected).filter((k) => selected[k])
@@ -312,7 +314,7 @@ function TurnTail(props: TurnTailProps): ReactNode {
   const skillNames = skillNamesOf(entry)
   return createElement('div', { style: containerStyle },
     createElement(BadgeRows, { entry }),
-    createElement(HintRow, { skillNames, inputActions: props.inputActions }),
+    createElement(HintRow, { skillNames, inputActions: props.inputActions, sessionId: props.sessionId }),
   )
 }
 
@@ -337,7 +339,7 @@ function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
     chip,
     createElement('div', { style: popoverStyle },
       createElement(BadgeRows, { entry }),
-      createElement(HintRow, { skillNames: skillNamesOf(entry), inputActions: props.inputActions }),
+      createElement(HintRow, { skillNames: skillNamesOf(entry), inputActions: props.inputActions, sessionId: props.sessionId }),
     ),
   )
 }
