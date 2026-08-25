@@ -25,7 +25,7 @@
  * before any early return) — a hard rule this component family enforces
  * after a past hooks-order regression.
  */
-import { createElement, useEffect, useState, type CSSProperties, type ReactNode } from 'react'
+import { createElement, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import type { SkillCandidate, SkillLedgerView, SkillStats } from '../types.ts'
 
 const name = 'skill-ledger-client'
@@ -103,7 +103,7 @@ const reportBodyStyle: CSSProperties = { marginTop: 6, fontSize: 11, color: 'var
 const rerunBtn: CSSProperties = { borderRadius: 8, border: '1px solid var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-brand-primary)', background: 'transparent', padding: '3px 10px', fontSize: 11, cursor: 'pointer' }
 const summaryChipBtn: CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '1px 7px', borderRadius: 999, background: 'transparent', color: 'var(--dsw-alias-label-tertiary)', border: '1px solid var(--dsw-alias-border-l1)', whiteSpace: 'nowrap', fontSize: 11, lineHeight: 1.4, cursor: 'pointer', fontFamily: 'inherit' }
 const popoverAnchor: CSSProperties = { position: 'relative', display: 'inline-flex', flex: 'none' }
-const popoverStyle: CSSProperties = { position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 30, minWidth: 280, maxWidth: 480, background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 10, boxShadow: 'var(--dsw-shadow-lv3)', padding: '4px 6px' }
+const popoverStyle: CSSProperties = { position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 30, minWidth: 280, maxWidth: 'min(480px, calc(100vw - 16px))', background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 10, boxShadow: 'var(--dsw-shadow-lv3)', padding: '4px 6px' }
 
 // ── trail derivation ────────────────────────────────────────────────────────
 
@@ -160,22 +160,30 @@ function deriveTrail(snapshot: SnapshotLike | undefined, turn: TurnLocationLike)
 }
 
 /** Actions-seat path: boundaries from the snapshot's completed-turn index.
- * Turn boundaries are monotonically increasing, so the start boundary is the
- * largest known turn-end strictly below this turn's end (that is turn N-1's
- * end when it is in-window). Falling back to -1 when N-1's end is missing
- * (window truncation on old sessions) would swallow EVERY earlier in-window
- * turn's tools into this one — the conservative bound prevents that. */
+ * Turn ends are monotonic, so the start boundary is the largest known
+ * turn-end strictly below this turn's end (turn N-1's end when in-window).
+ * When NO earlier boundary is known — turn 1, or window truncation on old
+ * sessions — the lower edge is genuinely unbounded and a -1 fallback would
+ * swallow every earlier in-window turn's tools into this one (observed as
+ * an inflated chip). Bail out instead: a turn we cannot bound is a turn we
+ * cannot badge from this seat; the chain seat (engine-owned TurnLocation
+ * boundaries) still covers those turns. */
 function deriveTrailByNumber(snapshot: SnapshotLike | undefined, turnNo: number): Trail | undefined {
   if (!snapshot) return undefined
   const ends = snapshot.turnEnds
   const endRaw = ends?.get(turnNo)
   const end = typeof endRaw === 'number' ? endRaw : Number.MAX_SAFE_INTEGER
   let start = -1
+  let bounded = false
   if (ends !== undefined) {
     for (const [t, s] of ends) {
-      if (t !== turnNo && typeof s === 'number' && s < end && s > start) start = s
+      if (t !== turnNo && typeof s === 'number' && s < end && s > start) {
+        start = s
+        bounded = true
+      }
     }
   }
+  if (!bounded) return undefined
   return trailFromNodes(snapshot.nodes, start, end)
 }
 
@@ -258,17 +266,27 @@ function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]
   const [cand, setCand] = useState<SkillCandidate[] | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
   const skillKey = skillNames.join(',')
+  const prevSkillKey = useRef<string | null>(null)
   useEffect(() => {
     if (skillNames.length === 0) {
       setCand(null)
       setSelected({})
+      prevSkillKey.current = null
       return
     }
+    // Any change of the skill SET (not just to-empty) invalidates stale
+    // selections from a previous turn sharing this component instance.
+    if (prevSkillKey.current !== null && prevSkillKey.current !== skillKey) setSelected({})
+    prevSkillKey.current = skillKey
     let cancelled = false
     fetch(`/api/skill-ledger/candidates${typeof sessionId === 'string' && sessionId !== '' ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`)
       .then((r) => r.json())
-      .then((res: { skills?: SkillCandidate[] }) => {
+      .then((res: { skills?: SkillCandidate[]; error?: string }) => {
         if (cancelled) return
+        if (typeof res?.error === 'string' && res.error !== '') {
+          setCand([{ name: `(${res.error})`, description: '' }])
+          return
+        }
         const arr = Array.isArray(res?.skills) ? res.skills : []
         setCand(arr.filter((s) => s && typeof s.name === 'string' && !skillNames.includes(s.name)).slice(0, 6))
       })
@@ -276,7 +294,9 @@ function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]
     return () => { cancelled = true }
   }, [skillKey, skillNames.length, sessionId])
 
-  if (skillNames.length === 0) return null
+  // Empty result (fetch settled, nothing applicable): hide the whole row
+  // instead of leaving an orphaned hint label with no chips.
+  if (skillNames.length === 0 || (cand !== null && cand.length === 0)) return null
   const chosen = Object.keys(selected).filter((k) => selected[k])
   function rerun(): void {
     if (chosen.length === 0) return
@@ -322,6 +342,24 @@ function TurnTail(props: TurnTailProps): ReactNode {
 
 function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
   const [open, setOpen] = useState(false)
+  const anchorRef = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    if (!open) return
+    // Outside-click and Escape dismissal for the popover: without this the
+    // popover hangs over sibling action-row entries until the chip itself is
+    // clicked again.
+    const onDown = (ev: MouseEvent): void => {
+      const anchor = anchorRef.current
+      if (anchor !== null && ev.target instanceof Node && !anchor.contains(ev.target)) setOpen(false)
+    }
+    const onKey = (ev: KeyboardEvent): void => { if (ev.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
   const snapshot = props.useSession ? props.useSession((s) => s) : undefined
   const turnNo = turnOfMessage(snapshot, props.messageId)
   const entry = turnNo !== undefined ? deriveTrailByNumber(snapshot, turnNo) : undefined
@@ -334,10 +372,12 @@ function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
     title: '本輪技能/工具徽章',
     onClick: () => { setOpen(!open) },
   }, label + (open ? ' ▾' : ' ▸'))
-  if (!open) return createElement('span', { style: popoverAnchor }, chip)
-  return createElement('span', { style: popoverAnchor },
+  if (!open) return createElement('span', { ref: anchorRef, style: popoverAnchor }, chip)
+  return createElement('span', { ref: anchorRef, style: popoverAnchor },
     chip,
-    createElement('div', { style: popoverStyle },
+    // Flip the popover upward when the anchor sits in the lower half of the
+    // viewport (action rows usually do) so it never falls off-screen.
+    createElement('div', { style: { ...popoverStyle, ...(anchorRef.current && typeof anchorRef.current.getBoundingClientRect === 'function' && anchorRef.current.getBoundingClientRect().top > (typeof window !== 'undefined' && window.innerHeight ? window.innerHeight / 2 : 1e9) ? { top: 'auto', bottom: '100%', marginTop: 0, marginBottom: 4 } : {}) } },
       createElement(BadgeRows, { entry }),
       createElement(HintRow, { skillNames: skillNamesOf(entry), inputActions: props.inputActions, sessionId: props.sessionId }),
     ),
@@ -365,15 +405,15 @@ function SkillsView(props: ViewProps): ReactNode {
 
   function analyze(skill: string): void {
     if (sid === '') return
-    setReports({ ...reports, [skill]: { busy: true } })
+    setReports((prev) => ({ ...prev, [skill]: { busy: true } }))
     fetch('/api/skill-ledger/analyze', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: sid, skill }),
     })
       .then((r) => r.json())
-      .then((res: AnalyzeReport['data']) => { setReports({ ...reports, [skill]: { busy: false, data: res } }) })
-      .catch((err: unknown) => { setReports({ ...reports, [skill]: { busy: false, error: String(err) } }) })
+      .then((res: AnalyzeReport['data']) => { setReports((prev) => ({ ...prev, [skill]: { busy: false, data: res } })) })
+      .catch((err: unknown) => { setReports((prev) => ({ ...prev, [skill]: { busy: false, error: String(err) } })) })
   }
   function deepAnalyze(skill: string): void {
     if (!props.inputActions || typeof props.inputActions.setDraft !== 'function') return
