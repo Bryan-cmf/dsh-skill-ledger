@@ -26,7 +26,8 @@ const name = 'skill-ledger'
 
 const MAX_TURNS = 500
 const MAX_CALLS_PER_TURN = 60
-/** Catalog candidates served per request; the client narrows to 6 hint chips. */
+/** Top-ranked catalog candidates served per request (relevance order when a
+ * task signal exists); the client narrows to 6 hint chips. */
 const MAX_CANDIDATES = 12
 
 /** Hard dependencies — all shipped in the dsh-base bundle. */
@@ -86,6 +87,76 @@ interface SkillsService {
 interface SessionsService {
   get(id: string): unknown
 }
+/** Minimal committed-event view of a session (the projection registry also
+ * folds over session.events). Only user/message text is read here. */
+interface SessionEventsLike {
+  events?: Array<{
+    type: string
+    data?: {
+      content?: Array<{ type?: string; text?: string }> | null
+      text?: string
+    }
+  }>
+}
+// ── candidate relevance ranking ───────────────────────────────────────────────
+
+/** Latin words (≥2 chars) + CJK character bigrams: Chinese task text has no
+ * spaces, so bigram overlap is what makes 港股 vs 港股調查 comparable. */
+function tokensOf(text: string): Set<string> {
+  const out = new Set<string>()
+  for (const m of text.toLowerCase().matchAll(/[a-z0-9]{2,}/g)) out.add(m[0])
+  for (const run of text.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
+    const runText = run[0]
+    if (runText.length === 2) out.add(runText)
+    else for (let i = 0; i + 1 < runText.length; i++) out.add(runText.slice(i, i + 2))
+  }
+  return out
+}
+
+const TASK_TEXT_MAX_CHARS = 500
+
+/** Last committed user-message text, truncated. Empty → no ranking signal. */
+function recentTaskText(session: SessionEventsLike | undefined): string {
+  const events = session && Array.isArray(session.events) ? session.events : []
+  let text = ''
+  for (let i = events.length - 1; i >= 0 && text === ''; i--) {
+    const ev = events[i]
+    if (!ev || ev.type !== 'user/message') continue
+    const d = ev.data
+    if (d && typeof d.text === 'string' && d.text !== '') text = d.text
+    else if (d && Array.isArray(d.content)) {
+      for (const c of d.content) {
+        if (c && c.type === 'text' && typeof c.text === 'string' && c.text !== '') { text = c.text; break }
+      }
+    }
+  }
+  return text.slice(0, TASK_TEXT_MAX_CHARS)
+}
+
+/** Relevance score: name-token hits weigh ×3, description hits ×1. The whole
+ * catalog is scored, then stable-sorted by score desc (alphabetical tiebreak;
+ * no task text → plain alphabetical, the previous behavior). */
+function rankCandidates(
+  list: Array<{ name: string; description: string }>,
+  taskText: string,
+): Array<{ name: string; description: string }> {
+  const ranked = list.map((s) => ({ ...s, nameLower: s.name.toLowerCase() }))
+  if (taskText !== '') {
+    const taskTokens = tokensOf(taskText)
+    const scored = ranked.map((s) => {
+      let score = 0
+      for (const t of tokensOf(s.name)) if (taskTokens.has(t)) score += 3
+      for (const t of tokensOf(s.description)) if (taskTokens.has(t)) score += 1
+      return { ...s, score }
+    })
+    scored.sort((a, b) => (b.score - a.score) || (a.nameLower < b.nameLower ? -1 : a.nameLower > b.nameLower ? 1 : 0))
+    return scored
+  }
+  // no signal: score everything 0, stable order = alphabetical
+  ranked.sort((a, b) => (a.nameLower < b.nameLower ? -1 : a.nameLower > b.nameLower ? 1 : 0))
+  return ranked
+}
+
 interface AgentsService {
   /** Agent and Session share the same id axis. */
   get(id: string): { session: { header: { cwd?: unknown } } } | undefined
@@ -318,17 +389,20 @@ function apply(ctx: HostCtx): void {
         const url = new URL(req.url ?? '/', 'http://x')
         const sid = url.searchParams.get('sessionId') ?? ''
         const lookup = sid !== '' ? lookupOf(ctx, sid) : {}
+        // Full catalog first — relevance ranking needs the whole pool to beat
+        // alphabetical order, so no early break here.
         const list = await ctx.skills.list(lookup)
-        const arr: Array<{ name: string; description: string }> = []
+        const pool: Array<{ name: string; description: string }> = []
         for (const s of Array.isArray(list) ? list : []) {
           if (!s || typeof s.name !== 'string' || s.name === '') continue
-          arr.push({
+          pool.push({
             name: s.name,
             description: typeof s.description === 'string' ? s.description.slice(0, 120) : '',
           })
-          if (arr.length >= MAX_CANDIDATES) break
         }
-        sendJson(res, { skills: arr })
+        const session = sid !== '' ? (ctx.sessions.get(sid) as SessionEventsLike | undefined) : undefined
+        const ranked = rankCandidates(pool, recentTaskText(session))
+        sendJson(res, { skills: ranked.slice(0, MAX_CANDIDATES) })
       } catch (error) {
         sendJson(res, { skills: [], error: String((error as Error)?.message ?? error) })
       }
