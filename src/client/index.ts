@@ -200,7 +200,8 @@ function BadgeRows({ entry }: { entry: Trail }): ReactNode {
   const toolChips = chipsOf(entry, false)
   if (skillChips.length > 0) rows.push(renderRow('技能 Skills', skillChips))
   if (toolChips.length > 0) rows.push(renderRow('工具 Tools', toolChips))
-  return createElement('div', { style: containerStyle }, rows)
+  // 無外層容器：TurnTail 已包 containerStyle（先前雙層容器造成雙倍 padding）。
+  return createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } }, rows)
 }
 
 /** 0.1.7 no longer dispatches `inputActions` to view/action entries, so
