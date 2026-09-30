@@ -26,6 +26,9 @@ const name = 'skill-ledger'
 
 const MAX_TURNS = 500
 const MAX_CALLS_PER_TURN = 60
+/** Assistant-message → turn map cap (a turn can emit several assistant
+ * messages, so this is deliberately looser than MAX_TURNS). */
+const MAX_MESSAGES = 2000
 /** Top-ranked catalog candidates served per request (relevance order when a
  * task signal exists); the client narrows to 6 hint chips. */
 const MAX_CANDIDATES = 12
@@ -49,6 +52,10 @@ interface ToolResultData {
   turn?: unknown
   message?: unknown
   error?: unknown
+}
+interface AssistantMessageData {
+  turn?: unknown
+  message?: { id?: unknown }
 }
 interface MessageShape {
   isError?: unknown
@@ -87,16 +94,48 @@ interface SkillsService {
 interface SessionsService {
   get(id: string): unknown
 }
-/** Minimal committed-event view of a session (the projection registry also
- * folds over session.events). Only user/message text is read here. */
+/** Minimal committed-event view of a session. 0.1.7 Session exposes the
+ * committed log through ownEvents()/snapshotEvents() (no public `events`
+ * array — reading one silently returned [] and killed relevance ranking). */
 interface SessionEventsLike {
-  events?: Array<{
-    type: string
-    data?: {
-      content?: Array<{ type?: string; text?: string }> | null
-      text?: string
+  ownEvents?: () => Array<{ type: string; data?: unknown }>
+  snapshotEvents?: () => Array<{ type: string; data?: unknown }>
+}
+function eventsOf(session: SessionEventsLike | undefined): Array<{ type: string; data?: unknown }> {
+  if (!session) return []
+  if (typeof session.ownEvents === 'function') {
+    try {
+      const ev = session.ownEvents()
+      if (Array.isArray(ev)) return ev
+    } catch {
+      // fall through to snapshotEvents
     }
-  }>
+  }
+  if (typeof session.snapshotEvents === 'function') {
+    try {
+      const ev = session.snapshotEvents()
+      if (Array.isArray(ev)) return ev
+    } catch {
+      // no event access
+    }
+  }
+  return []
+}
+/** user/message text: 0.1.7 data = { turn, step, message: { content: ContentBlock[] } }. */
+function userTextOf(data: unknown): string {
+  if (!data || typeof data !== 'object') return ''
+  const d = data as { text?: unknown; message?: { content?: unknown } }
+  if (typeof d.text === 'string' && d.text !== '') return d.text
+  const content = d.message && typeof d.message === 'object' ? d.message.content : undefined
+  if (Array.isArray(content)) {
+    for (const c of content) {
+      if (c && typeof c === 'object' && (c as { type?: unknown }).type === 'text') {
+        const t = (c as { text?: unknown }).text
+        if (typeof t === 'string' && t !== '') return t
+      }
+    }
+  }
+  return ''
 }
 // ── candidate relevance ranking ───────────────────────────────────────────────
 
@@ -117,18 +156,12 @@ const TASK_TEXT_MAX_CHARS = 500
 
 /** Last committed user-message text, truncated. Empty → no ranking signal. */
 function recentTaskText(session: SessionEventsLike | undefined): string {
-  const events = session && Array.isArray(session.events) ? session.events : []
+  const events = eventsOf(session)
   let text = ''
   for (let i = events.length - 1; i >= 0 && text === ''; i--) {
     const ev = events[i]
     if (!ev || ev.type !== 'user/message') continue
-    const d = ev.data
-    if (d && typeof d.text === 'string' && d.text !== '') text = d.text
-    else if (d && Array.isArray(d.content)) {
-      for (const c of d.content) {
-        if (c && c.type === 'text' && typeof c.text === 'string' && c.text !== '') { text = c.text; break }
-      }
-    }
+    text = userTextOf(ev.data)
   }
   return text.slice(0, TASK_TEXT_MAX_CHARS)
 }
@@ -241,6 +274,20 @@ function pairingOf(data: ToolResultData): string {
 
 /** Pure fold: previous state + one committed event → next state. */
 function fold(state: LedgerState, event: SessionEventShape): LedgerState {
+  // assistant/message — record the closing message id → turn mapping the
+  // client's assistant-actions seat needs (0.1.7 dispatches only `messageId`
+  // there; the chat snapshot is no longer reachable from slot props).
+  if (event.type === 'assistant/message') {
+    const data = (event.data && typeof event.data === 'object' ? event.data : {}) as AssistantMessageData
+    const mid = data.message && typeof data.message === 'object' && typeof data.message.id === 'string' ? data.message.id : ''
+    if (mid === '' || data.turn === undefined) return state
+    const turnKey = String(data.turn)
+    if (state.byMessage[mid] === turnKey) return state
+    const byMessage = { ...state.byMessage, [mid]: turnKey }
+    const mids = Object.keys(byMessage)
+    if (mids.length > MAX_MESSAGES) delete byMessage[mids[0]!]
+    return { ...state, byMessage }
+  }
   if (event.type !== 'tool/call' && event.type !== 'tool/result') return state
   const data = (event.data && typeof event.data === 'object' ? event.data : {}) as ToolCallData & ToolResultData
   const turnKey = String(data.turn)
@@ -263,9 +310,9 @@ function fold(state: LedgerState, event: SessionEventShape): LedgerState {
       const oldest = String(Math.min(...keys))
       const trimmed = { ...nextTurns }
       delete trimmed[oldest]
-      return { turns: trimmed }
+      return { ...state, turns: trimmed }
     }
-    return { turns: nextTurns }
+    return { ...state, turns: nextTurns }
   }
 
   // tool/result — settle the paired pending call.
@@ -284,7 +331,7 @@ function fold(state: LedgerState, event: SessionEventShape): LedgerState {
   if (call.status !== 'pending') return state
   const nextCalls = [...prev]
   nextCalls[index] = { ...call, status: errorOf(data) ? 'err' : 'ok' }
-  return { turns: { ...turns, [turnKey]: nextCalls } }
+  return { ...state, turns: { ...turns, [turnKey]: nextCalls } }
 }
 
 /** State → wire payload (the read-side projection). Null-prototype buckets
@@ -293,11 +340,17 @@ function view(state: LedgerState): unknown {
   const skills: Record<string, SkillStats> = Object.create(null)
   const tools: Record<string, SkillStats> = Object.create(null)
   const byTurn: Record<string, { skills: string[]; tools: string[]; errors: string[] }> = Object.create(null)
+  const trails: Record<string, Array<{ n: string; s: string; st: 'ok' | 'err' | 'pending' }>> = Object.create(null)
   let skillCallCount = 0
   const turns = state.turns ?? {}
   for (const turnKey of Object.keys(turns)) {
     const calls = turns[turnKey]
     if (!Array.isArray(calls)) continue
+    trails[turnKey] = calls.map((c) => ({
+      n: c && typeof c.name === 'string' ? c.name : '',
+      s: c && typeof c.skill === 'string' ? c.skill : '',
+      st: c && (c.status === 'err' || c.status === 'ok' || c.status === 'pending') ? c.status : 'pending',
+    }))
     for (const c of calls) {
       if (!c || typeof c !== 'object') continue
       const isSkill = c.skill !== ''
@@ -327,6 +380,8 @@ function view(state: LedgerState): unknown {
     skills,
     tools,
     byTurn,
+    byMessage: state.byMessage ?? {},
+    trails,
     total: { skills: Object.keys(skills).length, calls: skillCallCount },
   }
 }
@@ -371,13 +426,14 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 function apply(ctx: HostCtx): void {
   // 1. The session projection (correct contract: stateSchema + wire).
+  //    stateVersion 2: adds byMessage (assistant-message → turn) + trails.
   ctx.sessionProjections.register({
     key: 'skillLedger',
     stateSchema,
-    init: () => ({ turns: {} }),
+    init: () => ({ turns: {}, byMessage: {} }),
     apply: fold,
     wire: { viewSchema, view },
-    stateVersion: 1,
+    stateVersion: 2,
   })
 
   // 2. Client-facing routes.

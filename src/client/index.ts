@@ -1,25 +1,26 @@
 /**
- * @bryan-cmf/dsh-skill-ledger — Client half.
+ * @bryan-cmf/dsh-skill-ledger — Client half (0.1.7+ slot contract).
  *
- * A) `conversation.chat.turnTail` chain entry: beneath every completed reply,
- *    skill/tool badge rows derived from the local conversation snapshot, plus
- *    a non-blocking alternative-skill hint row (multi-select chips + a
- *    "re-run with selected skills" button that writes a prompt draft — the
- *    user stays in full control, nothing is ever intercepted).
+ * A) `conversation.chat.turnTail` list entry: beneath every completed reply,
+ *    skill/tool badge rows derived from the `skillLedger` host projection,
+ *    plus a non-blocking alternative-skill hint row. 0.1.7 dispatches owner
+ *    props `{ turn, seq, openFile }`; session-scope standard props supply
+ *    `useProjection`/`sessionId` (dsh-client-ui-session SessionStandardProps
+ *    merges into every session-scoped slot entry). The pre-0.1.7
+ *    `matched`/`useSession`(chat-snapshot) path no longer exists.
  *
  * A2) `conversation.chat.assistant-actions` list entry: a compact per-turn
- *    chip (🧩 技能×N·工具×M) that expands a popover with the SAME badge rows
- *    and hint row. Why a second seat: the turnTail slot is a CHAIN — the
- *    first entry whose select returns non-null wins and nothing else renders.
- *    The shipped deliverables entry claims every turn that produced files, so
- *    on those turns (most coding turns) the chain seat never reaches us. The
- *    actions slot is a LIST — every entry renders, so the chip coexists with
- *    the deliverables card and badges stay reachable under every reply.
+ *    chip (🧩 技能×N·工具×M) on every finalized assistant message. 0.1.7
+ *    dispatches only `{ messageId }`; the host projection's new `byMessage`
+ *    map (assistant/message fold) resolves messageId → turn, and `trails`
+ *    carries the per-turn call list.
  *
  * B) `conversation.view` list entry (id 'skills', order 60, label 技能): a
- *    Skills tab over the whole session — per-skill ledger stats from the
- *    host projection (`useProjection('skillLedger')`) plus capability/quality
- *    analysis buttons.
+ *    Skills tab over the whole session — per-skill ledger stats from
+ *    `useProjection('skillLedger')` plus capability/quality analysis buttons.
+ *    `inputActions` is no longer dispatched to view entries: the two
+ *    prompt-writing affordances (re-run hint, deep analysis) copy their
+ *    prompt to the clipboard instead.
  *
  * React hooks are called unconditionally at each component's top (effects run
  * before any early return) — a hard rule this component family enforces
@@ -31,48 +32,29 @@ import type { SkillCandidate, SkillLedgerView, SkillStats } from '../types.ts'
 const name = 'skill-ledger-client'
 const inject = ['slots']
 
-// ── minimal structural shapes of the conversation snapshot ──────────────────
+// ── slot props (0.1.7 dispatch + session standard props) ────────────────────
 
-interface TurnLocationLike {
-  turn?: number
-  start?: { seq?: number } | null
-  end?: { seq?: number } | null
-}
-interface ToolResultNodeLike {
-  kind: 'tool-result'
-  seq: number
-  callId: string
-  call?: { name: string; argsRaw: string } | null
-  isError: boolean
-}
-interface AssistantNodeLike {
-  kind: 'assistant'
-  messageId?: string
-  turn?: number
-}
-interface SnapshotLike {
-  nodes?: (ToolResultNodeLike | AssistantNodeLike)[]
-  turnEnds?: ReadonlyMap<number, number>
-}
-interface InputActionsLike {
-  setDraft?: (text: string) => void
+/** Loose shape of the framework's session-scoped `useProjection` hook. */
+interface UseProjectionLike {
+  (key: string): unknown
+  (key: string, selector: (value: unknown) => unknown): unknown
 }
 interface TurnTailProps {
-  matched?: TurnLocationLike | null
+  /** Owner prop from the turnTail dispatcher (the closing turn number). */
+  turn?: number
+  /** Session standard props (auto-injected for session-scoped entries). */
   sessionId?: string
-  useSession?: <S>(selector: (snapshot: SnapshotLike) => S) => S
-  inputActions?: InputActionsLike
+  useProjection?: UseProjectionLike
 }
 interface AssistantActionsProps {
+  /** Owner prop from the assistant-actions dispatcher (the only one it sends). */
   messageId?: string
   sessionId?: string
-  useSession?: <S>(selector: (snapshot: SnapshotLike) => S) => S
-  inputActions?: InputActionsLike
+  useProjection?: UseProjectionLike
 }
 interface ViewProps {
   sessionId?: string
-  useProjection?: <K extends string>(key: K) => unknown
-  inputActions?: InputActionsLike
+  useProjection?: UseProjectionLike
 }
 interface SlotsService {
   inject(key: string, fn: () => unknown): unknown
@@ -105,7 +87,7 @@ const summaryChipBtn: CSSProperties = { display: 'inline-flex', alignItems: 'cen
 const popoverAnchor: CSSProperties = { position: 'relative', display: 'inline-flex', flex: 'none' }
 const popoverStyle: CSSProperties = { position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 30, minWidth: 280, maxWidth: 'min(480px, calc(100vw - 16px))', background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 10, boxShadow: 'var(--dsw-shadow-lv3)', padding: '4px 6px' }
 
-// ── trail derivation ────────────────────────────────────────────────────────
+// ── trail derivation (from the skillLedger projection) ──────────────────────
 
 interface TrailCall {
   name: string
@@ -116,87 +98,41 @@ interface Trail {
   triggered: TrailCall[]
 }
 
-/** Unified argument parsing: `name` first, `skill` fallback (host does the same). */
-function skillNameOf(argsRaw: string | undefined): string {
-  if (typeof argsRaw !== 'string') return ''
-  try {
-    const j = JSON.parse(argsRaw) as unknown
-    if (j && typeof j === 'object') {
-      const record = j as Record<string, unknown>
-      if (typeof record.name === 'string') return record.name
-      if (typeof record.skill === 'string') return record.skill
-    }
-  } catch {
-    // unparseable
-  }
-  return ''
+/** Loose structural view of the projection's wire payload (see types.ts). */
+interface LedgerWire {
+  trails?: Record<string, Array<{ n?: unknown; s?: unknown; st?: unknown }> | undefined>
+  byMessage?: Record<string, unknown>
 }
 
-function trailFromNodes(nodes: (ToolResultNodeLike | AssistantNodeLike)[] | undefined, startSeq: number, endSeq: number): Trail | undefined {
+/** Per-turn call trail from the projection's `trails` table. */
+function trailOfLedger(raw: unknown, turnKey: string | undefined): Trail | undefined {
+  if (turnKey === undefined) return undefined
+  const ledger = raw && typeof raw === 'object' ? (raw as LedgerWire) : null
+  const arr = ledger && ledger.trails ? ledger.trails[turnKey] : undefined
+  if (!Array.isArray(arr) || arr.length === 0) return undefined
   const triggered: TrailCall[] = []
-  for (const node of Array.isArray(nodes) ? nodes : []) {
-    if (!node || (node as ToolResultNodeLike).kind !== 'tool-result') continue
-    const tr = node as ToolResultNodeLike
-    const seq = typeof tr.seq === 'number' ? tr.seq : -1
-    if (seq <= startSeq || seq > endSeq) continue
-    const name = tr.call && typeof tr.call.name === 'string' ? tr.call.name : ''
+  for (const c of arr) {
+    if (!c || typeof c !== 'object') continue
+    const call = c as { n?: unknown; s?: unknown; st?: unknown }
+    const name = typeof call.n === 'string' ? call.n : ''
     if (name === '') continue
     triggered.push({
       name,
-      skill: name === 'skill' ? skillNameOf(tr.call ? tr.call.argsRaw : undefined) : '',
-      status: tr.isError === true ? 'err' : 'ok',
+      skill: typeof call.s === 'string' ? call.s : '',
+      status: call.st === 'err' ? 'err' : 'ok',
     })
   }
   if (triggered.length === 0) return undefined
   return { triggered }
 }
 
-/** Chain-seat path: boundaries from the engine-owned TurnLocation. */
-function deriveTrail(snapshot: SnapshotLike | undefined, turn: TurnLocationLike): Trail | undefined {
-  if (!snapshot || !turn) return undefined
-  const startSeq = turn.start && typeof turn.start.seq === 'number' ? turn.start.seq : -1
-  const endSeq = turn.end && typeof turn.end.seq === 'number' ? turn.end.seq : Number.MAX_SAFE_INTEGER
-  return trailFromNodes(snapshot.nodes, startSeq, endSeq)
-}
-
-/** Actions-seat path: boundaries from the snapshot's completed-turn index.
- * Turn ends are monotonic, so the start boundary is the largest known
- * turn-end strictly below this turn's end (turn N-1's end when in-window).
- * When NO earlier boundary is known — turn 1, or window truncation on old
- * sessions — the lower edge is genuinely unbounded and a -1 fallback would
- * swallow every earlier in-window turn's tools into this one (observed as
- * an inflated chip). Bail out instead: a turn we cannot bound is a turn we
- * cannot badge from this seat; the chain seat (engine-owned TurnLocation
- * boundaries) still covers those turns. */
-function deriveTrailByNumber(snapshot: SnapshotLike | undefined, turnNo: number): Trail | undefined {
-  if (!snapshot) return undefined
-  const ends = snapshot.turnEnds
-  const endRaw = ends?.get(turnNo)
-  const end = typeof endRaw === 'number' ? endRaw : Number.MAX_SAFE_INTEGER
-  let start = -1
-  let bounded = false
-  if (ends !== undefined) {
-    for (const [t, s] of ends) {
-      if (t !== turnNo && typeof s === 'number' && s < end && s > start) {
-        start = s
-        bounded = true
-      }
-    }
-  }
-  if (!bounded) return undefined
-  return trailFromNodes(snapshot.nodes, start, end)
-}
-
-/** The closing assistant's messageId → its turn number (assistant nodes carry both). */
-function turnOfMessage(snapshot: SnapshotLike | undefined, messageId: string | undefined): number | undefined {
-  if (!snapshot || messageId === undefined) return undefined
-  for (const node of Array.isArray(snapshot.nodes) ? snapshot.nodes : []) {
-    const a = node as AssistantNodeLike
-    if (a && a.kind === 'assistant' && a.messageId === messageId) {
-      return typeof a.turn === 'number' ? a.turn : undefined
-    }
-  }
-  return undefined
+/** Assistant message id → turn key, from the projection's `byMessage` map
+ * (folded host-side from `assistant/message` events). */
+function turnOfMessageInLedger(raw: unknown, messageId: string | undefined): string | undefined {
+  if (messageId === undefined) return undefined
+  const ledger = raw && typeof raw === 'object' ? (raw as LedgerWire) : null
+  const turn = ledger && ledger.byMessage ? ledger.byMessage[messageId] : undefined
+  return typeof turn === 'string' ? turn : undefined
 }
 
 function skillNamesOf(trail: Trail): string[] {
@@ -206,6 +142,10 @@ function skillNamesOf(trail: Trail): string[] {
   }
   return names
 }
+
+/** Hooks-order safety: call useProjection unconditionally with a noop
+ * fallback instead of conditionally invoking the prop. */
+const noopProjection = (): undefined => undefined
 
 // ── badge rows + hint row (shared by both seats) ────────────────────────────
 
@@ -261,10 +201,26 @@ function BadgeRows({ entry }: { entry: Trail }): ReactNode {
   return createElement('div', { style: containerStyle }, rows)
 }
 
+/** 0.1.7 no longer dispatches `inputActions` to view/action entries, so
+ * prompt-writing affordances copy their prompt to the clipboard instead
+ * (plain prompt() fallback where the Clipboard API is unavailable). */
+function copyPrompt(text: string): void {
+  try {
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      void navigator.clipboard.writeText(text).catch(() => { window.prompt('請複製以下提示詞：', text) })
+      return
+    }
+  } catch {
+    // fall through to prompt()
+  }
+  window.prompt('請複製以下提示詞：', text)
+}
+
 /** Pillar B: the non-blocking alternative-skill hint row (own state/effect). */
-function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]; inputActions?: InputActionsLike; sessionId?: string }): ReactNode {
+function HintRow({ skillNames, sessionId }: { skillNames: string[]; sessionId?: string }): ReactNode {
   const [cand, setCand] = useState<SkillCandidate[] | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
+  const [copied, setCopied] = useState(false)
   const skillKey = skillNames.join(',')
   const prevSkillKey = useRef<string | null>(null)
   useEffect(() => {
@@ -300,10 +256,11 @@ function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]
   const chosen = Object.keys(selected).filter((k) => selected[k])
   function rerun(): void {
     if (chosen.length === 0) return
-    if (!inputActions || typeof inputActions.setDraft !== 'function') return
-    inputActions.setDraft(
+    copyPrompt(
       `請使用技能 ${chosen.join('、')} 重新處理上一輪任務(該輪使用了 ${skillNames.join('、')})。若你對前輪結果有不滿意的具體點,可在此補充說明。`,
     )
+    setCopied(true)
+    window.setTimeout(() => { setCopied(false) }, 2500)
   }
   const list = cand === null ? [] : cand
   return createElement('div', { style: rowStyle },
@@ -326,21 +283,21 @@ function HintRow({ skillNames, inputActions, sessionId }: { skillNames: string[]
       onClick: () => { setSelected({ ...selected, [s.name]: !selected[s.name] }) },
     }, (selected[s.name] ? '✓ ' : '') + s.name)),
     cand === null ? createElement('span', { style: { ...chipBase, opacity: 0.6 } }, '…') : null,
-    chosen.length > 0 ? createElement('button', { style: rerunBtn, onClick: rerun }, '用選定技能重跑') : null,
+    chosen.length > 0 ? createElement('button', { style: rerunBtn, onClick: rerun }, copied ? '✓ 已複製提示' : '複製重跑提示') : null,
   )
 }
 
-// ── seat 1: the turnTail chain entry ────────────────────────────────────────
+// ── seat 1: the turnTail list entry ─────────────────────────────────────────
 
 function TurnTail(props: TurnTailProps): ReactNode {
-  const turn = props.matched
-  const snapshot = props.useSession ? props.useSession((s) => s) : undefined
-  const entry = turn ? deriveTrail(snapshot, turn) : undefined
+  const turnKey = typeof props.turn === 'number' ? String(props.turn) : undefined
+  const ledger = (props.useProjection ?? noopProjection)('skillLedger')
+  const entry = trailOfLedger(ledger, turnKey)
   if (!entry) return null
   const skillNames = skillNamesOf(entry)
   return createElement('div', { style: containerStyle },
     createElement(BadgeRows, { entry }),
-    createElement(HintRow, { skillNames, inputActions: props.inputActions, sessionId: props.sessionId }),
+    createElement(HintRow, { skillNames, sessionId: props.sessionId }),
   )
 }
 
@@ -366,9 +323,9 @@ function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
       document.removeEventListener('keydown', onKey)
     }
   }, [open])
-  const snapshot = props.useSession ? props.useSession((s) => s) : undefined
-  const turnNo = turnOfMessage(snapshot, props.messageId)
-  const entry = turnNo !== undefined ? deriveTrailByNumber(snapshot, turnNo) : undefined
+  const ledger = (props.useProjection ?? noopProjection)('skillLedger')
+  const turnKey = turnOfMessageInLedger(ledger, props.messageId)
+  const entry = trailOfLedger(ledger, turnKey)
   if (!entry) return null
   const skillChips = chipsOf(entry, true)
   const toolChips = chipsOf(entry, false)
@@ -387,7 +344,7 @@ function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
     // viewport (action rows usually do) so it never falls off-screen.
     createElement('div', { style: { ...popoverStyle, ...(anchorRef.current && typeof anchorRef.current.getBoundingClientRect === 'function' && anchorRef.current.getBoundingClientRect().top > (typeof window !== 'undefined' && window.innerHeight ? window.innerHeight / 2 : 1e9) ? { top: 'auto', bottom: '100%', marginTop: 0, marginBottom: 4 } : {}) } },
       createElement(BadgeRows, { entry }),
-      createElement(HintRow, { skillNames: skillNamesOf(entry), inputActions: props.inputActions, sessionId: props.sessionId }),
+      createElement(HintRow, { skillNames: skillNamesOf(entry), sessionId: props.sessionId }),
     ),
   )
 }
@@ -401,7 +358,7 @@ interface AnalyzeReport {
 }
 
 function SkillsView(props: ViewProps): ReactNode {
-  const ledgerRaw = props.useProjection ? props.useProjection('skillLedger') : undefined
+  const ledgerRaw = (props.useProjection ?? noopProjection)('skillLedger')
   const [reports, setReports] = useState<Record<string, AnalyzeReport>>({})
   const [openSkill, setOpenSkill] = useState('')
   const sid = typeof props.sessionId === 'string' ? props.sessionId : ''
@@ -424,8 +381,7 @@ function SkillsView(props: ViewProps): ReactNode {
       .catch((err: unknown) => { setReports((prev) => ({ ...prev, [skill]: { busy: false, error: String(err) } })) })
   }
   function deepAnalyze(skill: string): void {
-    if (!props.inputActions || typeof props.inputActions.setDraft !== 'function') return
-    props.inputActions.setDraft(
+    copyPrompt(
       `請使用 skill-analysis 技能,對技能「${skill}」做源碼級能力與質量分析(觸發面/架構模式/風險點/適用性),輸出「借什麼、不借什麼、怎麼借」的結構化報告。`,
     )
   }
@@ -483,7 +439,7 @@ function SkillsView(props: ViewProps): ReactNode {
           style: brandBtn,
           onClick: () => { if (openSkill === skill) { setOpenSkill('') } else { setOpenSkill(skill); analyze(skill) } },
         }, openSkill === skill ? '收起' : '⚙ 分析能力/質量'),
-        createElement('button', { style: smallBtn, onClick: () => deepAnalyze(skill) }, '🔬 深度分析'),
+        createElement('button', { style: smallBtn, onClick: () => deepAnalyze(skill) }, '🔬 深度分析(複製提示)'),
       ),
       openSkill === skill && reportBody ? reportBody : null,
     )
@@ -497,16 +453,17 @@ function SkillsView(props: ViewProps): ReactNode {
 }
 
 function apply(ctx: ClientCtx): void {
-  // Seat 1 — the chain: full badge row under replies on turns the chain
-  // reaches (i.e. when no earlier entry — the shipped deliverables card —
-  // claimed the turn).
+  // Seat 1 — turnTail LIST entry (0.1.7 contract: kind 'list', options.id
+  // required; owner props {turn, seq, openFile}; session standard props
+  // supply useProjection/sessionId). The pre-0.1.7 chain-style `select`
+  // registration is gone: list entries all render, ordered by `order`.
   ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register(
-    { name: 'conversation.chat.turnTail', select: (owner: { turn?: unknown }) => (owner && owner.turn ? owner.turn : null) },
+    { name: 'conversation.chat.turnTail', id: 'skill-ledger', order: 50 },
     TurnTail,
   ))
   // Seat 2 — the actions list: a compact summary chip on EVERY completed
-  // turn's action row (list semantics — coexists with the deliverables card
-  // that wins the chain on file-producing turns).
+  // turn's action row (owner prop {messageId}; the projection's byMessage
+  // map resolves it to the turn).
   ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register(
     { name: 'conversation.chat.assistant-actions', id: 'skill-ledger', order: 100, label: '技能徽章' },
     AssistantActionsBadge,

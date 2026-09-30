@@ -23,6 +23,10 @@ export interface LedgerCall {
 export interface LedgerState {
   /** Turn number (as string key) → its calls, in call order. */
   turns: Record<string, LedgerCall[]>
+  /** Assistant message id → its turn key (string). Lets the client's
+   * assistant-actions seat map a finalized message back to its turn without
+   * a chat snapshot. Capped alongside `turns`. */
+  byMessage: Record<string, string>
 }
 
 /** Per-skill aggregate served by the projection view and the analyze route. */
@@ -41,6 +45,11 @@ export interface SkillLedgerView {
   skills: Record<string, SkillStats>
   tools: Record<string, SkillStats>
   byTurn: Record<string, { skills: string[]; tools: string[]; errors: string[] }>
+  /** Assistant message id → turn key; the actions-seat badge's turn lookup. */
+  byMessage: Record<string, string>
+  /** Per-turn compact call trail (`n` name, `s` skill, `st` status) — the
+   * badge rows' data source, replacing the pre-0.1.7 chat-snapshot path. */
+  trails: Record<string, Array<{ n: string; s: string; st: 'ok' | 'err' | 'pending' }>>
   total: { skills: number; calls: number }
 }
 
