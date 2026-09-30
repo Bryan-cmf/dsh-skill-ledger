@@ -40,8 +40,10 @@ interface UseProjectionLike {
   (key: string, selector: (value: unknown) => unknown): unknown
 }
 interface TurnTailProps {
-  /** Owner prop from the turnTail dispatcher (the closing turn number). */
-  turn?: number
+  /** Owner prop from the turnTail dispatcher: the engine's TurnLocation
+   * OBJECT ({ turn, start, end, status, steps, data }) — .turn is the
+   * closing turn number. (Numeric form tolerated for forward safety.) */
+  turn?: { turn?: unknown } | number
   /** Session standard props (auto-injected for session-scoped entries). */
   sessionId?: string
   useProjection?: UseProjectionLike
@@ -290,7 +292,14 @@ function HintRow({ skillNames, sessionId }: { skillNames: string[]; sessionId?: 
 // ── seat 1: the turnTail list entry ─────────────────────────────────────────
 
 function TurnTail(props: TurnTailProps): ReactNode {
-  const turnKey = typeof props.turn === 'number' ? String(props.turn) : undefined
+  // 0.1.7 dispatches `turn` as the TurnLocation OBJECT — unwrap .turn.
+  const raw = props.turn
+  const turnNo = typeof raw === 'number'
+    ? raw
+    : (raw && typeof raw === 'object' && typeof (raw as { turn?: unknown }).turn === 'number'
+        ? (raw as { turn: number }).turn
+        : undefined)
+  const turnKey = turnNo !== undefined ? String(turnNo) : undefined
   const ledger = (props.useProjection ?? noopProjection)('skillLedger')
   const entry = trailOfLedger(ledger, turnKey)
   if (!entry) return null
