@@ -1,7 +1,7 @@
 {
   "name": "@bryan-cmf/dsh-skill-ledger",
-  "description": "DSH-Plugin: skill ledger — per-reply skill badges + non-blocking alternative-skill hint row + a Skills tab (session-wide ledger with capability/quality analysis buttons); folds tool/call+tool/result into a correctly-wired skillLedger projection.",
-  "version": "0.1.0-alpha.0",
+  "description": "DSH-Plugin: skill ledger — per-reply skill/tool badges + a Skills tab (session-wide ledger, inline per-skill detail from the live catalog, capability/quality analysis); folds tool/call+tool/result and slash skill-invocations into a correctly-wired skillLedger projection.",
+  "version": "0.1.0-alpha.1",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

@@ -1,6 +1,6 @@
 # 🧩 Skill Ledger — DSH-Plugin
 
-> **Skills you can see, switch, and analyze.** Per-reply skill badges + a non-blocking alternative-skill hint + a session-wide Skills tab (ledger with capability/quality analysis).
+> **Skills you can see, explain, and analyze.** Per-reply skill badges + a session-wide Skills tab (ledger with inline per-skill detail and capability/quality analysis).
 
 **[English](README.md) · [繁體中文](README.zh.md)**
 
@@ -10,7 +10,7 @@
 ![Topics](https://img.shields.io/badge/topics-dsh--plugin%20%7C%20cordis--plugin-blue)
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plugin
-that turns skills into a first-class observable surface. Three pillars:
+that turns skills into a first-class observable surface. Two pillars:
 
 ## ✨ Features
 
@@ -29,39 +29,33 @@ slot is a *chain* with single-winner semantics — the shipped deliverables
 card claims every turn that produced files, and a chain elects exactly one
 entry:
 
-1. **`conversation.chat.turnTail` (chain seat)** — the full badge block +
-   hint row, rendered directly on turns the chain reaches (no files produced);
+1. **`conversation.chat.turnTail` (chain seat)** — the full badge block,
+   rendered directly on turns the chain reaches (no files produced);
 2. **`conversation.chat.assistant-actions` (list seat)** — a compact
    `🧩 N skills/M tools` chip on EVERY completed turn's action row (list slots
    render all entries, so it coexists with the deliverables card). Click it
-   to expand a popover with the same full badge block + hint row.
+   to expand a popover with the same full badge block.
 
 Result: badges are reachable under every reply, file-producing or not, without
 ever shadowing the shipped deliverables UI.
 
-### B — Non-blocking alternative-skill hint
-
-When a turn used at least one skill, the hint row appears:
-
-```
-🧩 Not happy? Try   [serenity-skill] [dcf-valuation] [ak-financial-analyst]  [Re-run with selected]
-```
-
-Multi-select candidate chips → the button writes a re-run prompt **draft** into
-the composer. Nothing is ever intercepted, popped, or timed out — you press
-Enter, or you don't. (The philosophical opposite of a blocking "skill gate".)
-
-### C — The Skills tab (`conversation.view`, id `skills`)
+### B — The Skills tab (`conversation.view`, id `skills`)
 
 A session-scoped tab beside chat/trajectory: per-skill ledger stats (calls /
 ok / err / turns / last-failing turn) backed by the **`skillLedger` session
 projection** (whole session, including out-of-window turns and cold-start
-backfill), plus two analysis affordances per skill:
+backfill). Every skill card also **explains the skill itself** — its live
+catalog description and provider, fetched once per session via
+`GET /api/skill-ledger/catalog` — plus two analysis affordances:
 
 - **⚙ capability/quality analysis** — instant structural report via
   `POST /api/skill-ledger/analyze` (folded stats + catalog definition digest);
-- **🔬 deep analysis** — writes a prompt draft that dispatches a
+- **🔬 deep analysis** — copies a prompt that dispatches a
   `skill-analysis` skill for a source-level capability/quality review.
+
+(The earlier "non-blocking alternative-skill hint" row was retired by owner
+request — suggesting alternates was noise; the tab now explains the skills
+actually used instead.)
 
 ## Why the projection is trustworthy
 
@@ -77,6 +71,12 @@ The fold also settles errors correctly: the committed `tool/result` event
 carries `isError` on its `message.content[]` block — **not** on `data.error`
 — and pairing happens through the block's `toolCallId`. Both facts were
 verified against real session logs.
+
+Slash (`/name`) skill invocations are folded too: the host's tool-skill hook
+commits them as synthetic `user/message` events (`source.kind =
+'skill-invocation'`) with **no** `tool/call`, attributed to the consuming
+turn via the fold's turn anchor (stateVersion 3; verified against 11 real
+injections across 4 committed session logs).
 
 ## Install
 
@@ -114,14 +114,14 @@ then install (`dsh plugin --profile <name> install`) and restart DSH.
 ## Configuration
 
 None in v0.1 — knobs are intentionally minimal. Caps are compile-time
-constants (`MAX_TURNS = 500`, `MAX_CALLS_PER_TURN = 60`, candidates served
-`12` → client narrows to `6`).
+constants (`MAX_TURNS = 500`, `MAX_CALLS_PER_TURN = 60`, catalog entries
+`500`, per-description cap `2000` chars).
 
 ## HTTP surface
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/api/skill-ledger/candidates` | GET | Catalog skills (name + 120-char description) |
+| `/api/skill-ledger/catalog` | GET `?sessionId=` | Live catalog: name + full description + provider (Skills-tab inline detail) |
 | `/api/skill-ledger/analyze` | POST `{sessionId, skill}` | Folded stats + definition digest |
 
 Both are fail-soft: errors return `{error}` with HTTP 200, never 5xx.

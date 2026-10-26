@@ -1,6 +1,6 @@
 # 🧩 Skill Ledger — DSH 插件
 
-> **技能看得見、選得出、析得動。** 每條回覆下方的技能/工具徽章 + 非阻斷候選技能提示 + 會話級「技能」標籤頁（台帳與能力/質量分析）。
+> **技能看得見、說得清、析得動。** 每條回覆下方的技能/工具徽章 + 會話級「技能」標籤頁（台帳、每技能內聯詳細說明與能力/質量分析）。
 
 **[English](README.md) · [繁體中文](README.zh.md)**
 
@@ -10,7 +10,7 @@
 ![Topics](https://img.shields.io/badge/topics-dsh--plugin%20%7C%20cordis--plugin-blue)
 
 一個 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）插件，
-把技能變成第一等的可觀測面。三大支柱：
+把技能變成第一等的可觀測面。兩大支柱：
 
 ## ✨ 功能
 
@@ -26,35 +26,29 @@
 徽章透過**兩個協作席位**渲染——因為 turnTail 槽是*單赢家鏈*：官方產物卡
 （deliverables）會認領每一個產出過檔案的輪次，而鏈只選出恰好一個條目：
 
-1. **`conversation.chat.turnTail`（鏈席位）**——完整徽章區 + 候補提示行，
+1. **`conversation.chat.turnTail`（鏈席位）**——完整徽章區，
    在鏈能到達的輪次（未產檔）直接渲染；
 2. **`conversation.chat.assistant-actions`（列表席位）**——每個已完成輪的
    操作列上都有一個緊湊的 `🧩 N技能/M工具` 芯片（列表槽所有條目並存，
-   與產物卡天然共存）。點擊展開彈出層，內含同樣的完整徽章區 + 候補行。
+   與產物卡天然共存）。點擊展開彈出層，內含同樣的完整徽章區。
 
 結果：無論是否產檔，每條回覆下方都能看到徽章，且絕不遮蔽官方產物 UI。
 
-### B — 非阻斷的候選技能提示
-
-該輪用過技能時，出現提示行：
-
-```
-🧩 不滿意？可試  [serenity-skill] [dcf-valuation] [ak-financial-analyst]  [用選定技能重跑]
-```
-
-多選候選芯片 → 按鈕把重跑提示詞**草稿**寫進輸入框。絕不攔截、絕不彈窗、
-絕無倒計時——你按 Enter 才會執行（與「阻斷式技能閘門」在哲學上相反）。
-
-### C — 「技能」標籤頁（`conversation.view`，id `skills`）
+### B — 「技能」標籤頁（`conversation.view`，id `skills`）
 
 與 chat/trajectory 並列的會話級標籤頁：每技能台帳統計（調用/成功/失敗/
 使用輪次/最後失敗輪），資料來自 **`skillLedger` 會話投影**（整個會話，
-含窗口外輪次與冷啟動回填），另有兩個分析入口：
+含窗口外輪次與冷啟動回填）。每張技能卡片同時**說明技能本身**——即時
+目錄中的描述與來源，經 `GET /api/skill-ledger/catalog` 每會話拉取一次
+——另有兩個分析入口：
 
 - **⚙ 分析能力/質量**——經 `POST /api/skill-ledger/analyze` 即時返回
   結構化報告（摺疊統計 + 目錄定義摘要）；
-- **🔬 深度分析**——把提示詞草稿寫進輸入框，派發 `skill-analysis`
+- **🔬 深度分析**——把提示詞複製到剪貼簿，派發 `skill-analysis`
   技能做源碼級能力/質量評測。
+
+（早期的「非阻斷候選技能提示」行已按擁有者要求移除——推薦替代技能是
+噪音；標籤頁改為把**實際用過的技能**講清楚。）
 
 ## 為什麼投影是可信的
 
@@ -67,6 +61,11 @@ host-only（客戶端拿不到值，緩存行還會迫使每次冷讀全量重�
 摺疊也正確結算錯誤：已提交的 `tool/result` 事件把 `isError` 放在
 `message.content[]` 塊上——**不在 `data.error`**——配對經由塊的
 `toolCallId`。兩件事都對照真實會話日誌核實過。
+
+斜杠（`/name`）技能調用同樣會被摺疊：宿主的 tool-skill 鉤子把它們提交為
+合成 `user/message`（`source.kind = 'skill-invocation'`），**沒有**
+`tool/call`；摺疊經 turn 錨定歸屬到消費輪次（stateVersion 3；對照 4 份
+已提交會話日誌中的 11 處真實注入核驗通過）。
 
 ## 安裝
 
@@ -103,13 +102,13 @@ host-only（客戶端拿不到值，緩存行還會迫使每次冷讀全量重�
 ## 配置
 
 v0.1 無配置——旋鈕刻意從簡。上限為編譯期常量（`MAX_TURNS = 500`、
-`MAX_CALLS_PER_TURN = 60`、候選返回 `12` 條 → 客戶端再裁至 `6`）。
+`MAX_CALLS_PER_TURN = 60`、目錄條目上限 `500`、單描述截斷 `2000` 字）。
 
 ## HTTP 介面
 
 | 路由 | 方法 | 用途 |
 | --- | --- | --- |
-| `/api/skill-ledger/candidates` | GET | 目錄技能（名稱 + 120 字描述） |
+| `/api/skill-ledger/catalog` | GET `?sessionId=` | 即時目錄：名稱 + 完整描述 + 來源（技能頁內聯說明） |
 | `/api/skill-ledger/analyze` | POST `{sessionId, skill}` | 摺疊統計 + 定義摘要 |
 
 兩者皆 fail-soft：錯誤以 `{error}` + HTTP 200 返回，絕不 5xx。

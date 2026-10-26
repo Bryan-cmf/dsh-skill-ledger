@@ -9,7 +9,7 @@
  *
  * 2. Serves two webServer routes for the client half (static packages have no
  *    package-private RPC channel; this mirrors how dsh-insights does it):
- *      GET  /api/skill-ledger/candidates            → catalog skills
+ *      GET  /api/skill-ledger/catalog?sessionId=       → live catalog w/ full descriptions (Skills-tab inline detail)
  *      POST /api/skill-ledger/analyze {sessionId, skill} → stats + definition digest
  *
  * Fold notes (verified against real committed events):
@@ -18,9 +18,17 @@
  *                            toolCallId, content, isError }] } }
  *   `isError` lives on the message content block — NOT on `data.error` (a
  *   field earlier trail implementations read and therefore never saw errors).
+ *   user/message data = { source: { kind: 'skill-invocation', name, form }, … }
+ *   — a user-explicit `/name` gesture is loaded host-side by the dsh-tool-skill
+ *   pre-step hook and committed as this synthetic message; NO tool/call is
+ *   emitted on that path (the model is instructed not to call the `skill` tool
+ *   for it), so without this branch slash invocations never reach the ledger.
+ *   These events carry NO `turn` but always commit AFTER the consuming turn's
+ *   `step/start` (verified in committed logs), so the fold attributes them to
+ *   the last turn-tagged event.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { LedgerCall, LedgerState, SkillDefinitionDigest, SkillStats } from './types.ts'
+import type { LedgerCall, LedgerState, SkillCatalogEntry, SkillDefinitionDigest, SkillStats } from './types.ts'
 
 const name = 'skill-ledger'
 
@@ -29,9 +37,13 @@ const MAX_CALLS_PER_TURN = 60
 /** Assistant-message → turn map cap (a turn can emit several assistant
  * messages, so this is deliberately looser than MAX_TURNS). */
 const MAX_MESSAGES = 2000
-/** Top-ranked catalog candidates served per request (relevance order when a
- * task signal exists); the client narrows to 6 hint chips. */
-const MAX_CANDIDATES = 12
+/** Inline-detail catalog served by the catalog route: entry cap and
+ * per-description cap (generous — the Skills tab renders real descriptions). */
+const MAX_CATALOG_ENTRIES = 500
+const MAX_DESCRIPTION_CHARS = 2000
+/** Slash-invocation deferred-queue cap (used only when a skill-invocation
+ * commits before any turn-tagged event — defensive, empty in practice). */
+const MAX_PENDING_INVOCATIONS = 32
 
 /** Hard dependencies — all shipped in the dsh-base bundle. */
 const inject = ['sessionProjections', 'webServer', 'skills', 'sessions', 'agents']
@@ -81,6 +93,7 @@ interface ProjectionRegistry {
 interface SkillSummaryLike {
   name?: unknown
   description?: unknown
+  provider?: unknown
 }
 interface SkillsService {
   list(options?: Record<string, unknown>): Promise<SkillSummaryLike[]>
@@ -93,101 +106,6 @@ interface SkillsService {
 }
 interface SessionsService {
   get(id: string): unknown
-}
-/** Minimal committed-event view of a session. 0.1.7 Session exposes the
- * committed log through ownEvents()/snapshotEvents() (no public `events`
- * array — reading one silently returned [] and killed relevance ranking). */
-interface SessionEventsLike {
-  ownEvents?: () => Array<{ type: string; data?: unknown }>
-  snapshotEvents?: () => Array<{ type: string; data?: unknown }>
-}
-function eventsOf(session: SessionEventsLike | undefined): Array<{ type: string; data?: unknown }> {
-  if (!session) return []
-  if (typeof session.ownEvents === 'function') {
-    try {
-      const ev = session.ownEvents()
-      if (Array.isArray(ev)) return ev
-    } catch {
-      // fall through to snapshotEvents
-    }
-  }
-  if (typeof session.snapshotEvents === 'function') {
-    try {
-      const ev = session.snapshotEvents()
-      if (Array.isArray(ev)) return ev
-    } catch {
-      // no event access
-    }
-  }
-  return []
-}
-/** user/message text: 0.1.7 data = { turn, step, message: { content: ContentBlock[] } }. */
-function userTextOf(data: unknown): string {
-  if (!data || typeof data !== 'object') return ''
-  const d = data as { text?: unknown; message?: { content?: unknown } }
-  if (typeof d.text === 'string' && d.text !== '') return d.text
-  const content = d.message && typeof d.message === 'object' ? d.message.content : undefined
-  if (Array.isArray(content)) {
-    for (const c of content) {
-      if (c && typeof c === 'object' && (c as { type?: unknown }).type === 'text') {
-        const t = (c as { text?: unknown }).text
-        if (typeof t === 'string' && t !== '') return t
-      }
-    }
-  }
-  return ''
-}
-// ── candidate relevance ranking ───────────────────────────────────────────────
-
-/** Latin words (≥2 chars) + CJK character bigrams: Chinese task text has no
- * spaces, so bigram overlap is what makes 港股 vs 港股調查 comparable. */
-function tokensOf(text: string): Set<string> {
-  const out = new Set<string>()
-  for (const m of text.toLowerCase().matchAll(/[a-z0-9]{2,}/g)) out.add(m[0])
-  for (const run of text.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
-    const runText = run[0]
-    if (runText.length === 2) out.add(runText)
-    else for (let i = 0; i + 1 < runText.length; i++) out.add(runText.slice(i, i + 2))
-  }
-  return out
-}
-
-const TASK_TEXT_MAX_CHARS = 500
-
-/** Last committed user-message text, truncated. Empty → no ranking signal. */
-function recentTaskText(session: SessionEventsLike | undefined): string {
-  const events = eventsOf(session)
-  let text = ''
-  for (let i = events.length - 1; i >= 0 && text === ''; i--) {
-    const ev = events[i]
-    if (!ev || ev.type !== 'user/message') continue
-    text = userTextOf(ev.data)
-  }
-  return text.slice(0, TASK_TEXT_MAX_CHARS)
-}
-
-/** Relevance score: name-token hits weigh ×3, description hits ×1. The whole
- * catalog is scored, then stable-sorted by score desc (alphabetical tiebreak;
- * no task text → plain alphabetical, the previous behavior). */
-function rankCandidates(
-  list: Array<{ name: string; description: string }>,
-  taskText: string,
-): Array<{ name: string; description: string }> {
-  const ranked = list.map((s) => ({ ...s, nameLower: s.name.toLowerCase() }))
-  if (taskText !== '') {
-    const taskTokens = tokensOf(taskText)
-    const scored = ranked.map((s) => {
-      let score = 0
-      for (const t of tokensOf(s.name)) if (taskTokens.has(t)) score += 3
-      for (const t of tokensOf(s.description)) if (taskTokens.has(t)) score += 1
-      return { ...s, score }
-    })
-    scored.sort((a, b) => (b.score - a.score) || (a.nameLower < b.nameLower ? -1 : a.nameLower > b.nameLower ? 1 : 0))
-    return scored
-  }
-  // no signal: score everything 0, stable order = alphabetical
-  ranked.sort((a, b) => (a.nameLower < b.nameLower ? -1 : a.nameLower > b.nameLower ? 1 : 0))
-  return ranked
 }
 
 interface AgentsService {
@@ -272,8 +190,45 @@ function pairingOf(data: ToolResultData): string {
   return ''
 }
 
+/** Record one settled slash-invocation. The injection only commits for an
+ * existing, user-invocable skill, so it settles directly as `ok`; the empty
+ * callId keeps it out of every tool/result pairing path. */
+function attachSkillInvocation(state: LedgerState, turnKey: string, skill: string): LedgerState {
+  const prev = state.turns[turnKey]
+  if (prev && prev.length >= MAX_CALLS_PER_TURN) return state
+  const call: LedgerCall = { name: 'skill', skill, status: 'ok', callId: '' }
+  const turns = { ...state.turns }
+  turns[turnKey] = prev ? [...prev, call] : [call]
+  return { ...state, turns }
+}
+
 /** Pure fold: previous state + one committed event → next state. */
 function fold(state: LedgerState, event: SessionEventShape): LedgerState {
+  // ── turn anchor + deferred slash-invocation flush ──────────────────────
+  // Skill-invocation injections carry no `turn`; every other engine event
+  // does. The last turn-tagged event is the injection's turn (verified order:
+  // step/start commits before the injected message batch).
+  const evData = event.data && typeof event.data === 'object' ? (event.data as Record<string, unknown>) : undefined
+  const tagged = evData && typeof evData.turn === 'number' && Number.isFinite(evData.turn) ? String(evData.turn) : null
+  if (tagged !== null && tagged !== state.lastTurn) state = { ...state, lastTurn: tagged }
+  const deferred = Array.isArray(state.pendingSkills) ? state.pendingSkills : null
+  if (typeof state.lastTurn === 'string' && deferred !== null && deferred.length > 0) {
+    let settled: LedgerState = { ...state, pendingSkills: [] }
+    for (const skill of deferred) settled = attachSkillInvocation(settled, state.lastTurn, skill)
+    state = settled
+  }
+  // ── user-explicit skill invocation (`/name` gesture) ───────────────────
+  if (event.type === 'user/message') {
+    const src = evData && evData.source && typeof evData.source === 'object'
+      ? (evData.source as Record<string, unknown>)
+      : undefined
+    if (src === undefined || src.kind !== 'skill-invocation' || typeof src.name !== 'string' || src.name === '') return state
+    if (typeof state.lastTurn === 'string') return attachSkillInvocation(state, state.lastTurn, src.name)
+    // No anchor committed yet: defer to the next turn tag (flush block above).
+    const queue = Array.isArray(state.pendingSkills) ? state.pendingSkills : []
+    if (queue.length >= MAX_PENDING_INVOCATIONS) return state
+    return { ...state, pendingSkills: [...queue, src.name] }
+  }
   // assistant/message — record the closing message id → turn mapping the
   // client's assistant-actions seat needs (0.1.7 dispatches only `messageId`
   // there; the chat snapshot is no longer reachable from slot props).
@@ -398,7 +353,8 @@ function sendJson(res: ServerResponse, value: unknown): void {
  * Resolve the skills-view lookup for a session id. Skill catalogs are layered
  * by scope and cwd (user-agents root, project roots, preset layers); calling
  * list/get WITHOUT them sees only the global layer — empty on this deployment
- * (verified live: candidates returned [] and get() returned undefined). The
+ * (verified live: the catalog listing returned [] and get() returned undefined).
+ * The
  * shipped skill tool passes { cwd, scope: agent }; we mirror that via the
  * agents registry (Agent and Session share the id axis).
  */
@@ -427,38 +383,42 @@ function readBody(req: IncomingMessage): Promise<string> {
 function apply(ctx: HostCtx): void {
   // 1. The session projection (correct contract: stateSchema + wire).
   //    stateVersion 2: adds byMessage (assistant-message → turn) + trails.
+  //    stateVersion 3: ingests slash-invocation user/messages (turn anchor +
+  //    deferred queue) — old cached rows lack the new fields, so replay.
   ctx.sessionProjections.register({
     key: 'skillLedger',
     stateSchema,
-    init: () => ({ turns: {}, byMessage: {} }),
+    init: () => ({ turns: {}, byMessage: {}, lastTurn: null, pendingSkills: [] }),
     apply: fold,
     wire: { viewSchema, view },
-    stateVersion: 2,
+    stateVersion: 3,
   })
 
   // 2. Client-facing routes.
   ctx.webServer.register({
     kind: 'exact',
-    path: '/api/skill-ledger/candidates',
+    path: '/api/skill-ledger/catalog',
     handler: async (req, res) => {
       try {
         const url = new URL(req.url ?? '/', 'http://x')
         const sid = url.searchParams.get('sessionId') ?? ''
         const lookup = sid !== '' ? lookupOf(ctx, sid) : {}
-        // Full catalog first — relevance ranking needs the whole pool to beat
-        // alphabetical order, so no early break here.
+        // Scope-aware listing (cwd + agent layer): the global layer alone is
+        // empty on layered deployments (verified live — see lookupOf).
         const list = await ctx.skills.list(lookup)
-        const pool: Array<{ name: string; description: string }> = []
+        const seen = new Set<string>()
+        const skills: SkillCatalogEntry[] = []
         for (const s of Array.isArray(list) ? list : []) {
-          if (!s || typeof s.name !== 'string' || s.name === '') continue
-          pool.push({
+          if (!s || typeof s.name !== 'string' || s.name === '' || seen.has(s.name)) continue
+          seen.add(s.name)
+          skills.push({
             name: s.name,
-            description: typeof s.description === 'string' ? s.description.slice(0, 120) : '',
+            description: typeof s.description === 'string' ? s.description.slice(0, MAX_DESCRIPTION_CHARS) : '',
+            provider: typeof s.provider === 'string' ? s.provider : '',
           })
         }
-        const session = sid !== '' ? (ctx.sessions.get(sid) as SessionEventsLike | undefined) : undefined
-        const ranked = rankCandidates(pool, recentTaskText(session))
-        sendJson(res, { skills: ranked.slice(0, MAX_CANDIDATES) })
+        skills.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        sendJson(res, { skills: skills.slice(0, MAX_CATALOG_ENTRIES) })
       } catch (error) {
         sendJson(res, { skills: [], error: String((error as Error)?.message ?? error) })
       }

@@ -2,8 +2,8 @@
  * @bryan-cmf/dsh-skill-ledger — Client half (0.1.7+ slot contract).
  *
  * A) `conversation.chat.turnTail` list entry: beneath every completed reply,
- *    skill/tool badge rows derived from the `skillLedger` host projection,
- *    plus a non-blocking alternative-skill hint row. 0.1.7 dispatches owner
+ *    skill/tool badge rows derived from the `skillLedger` host projection.
+ *    0.1.7 dispatches owner
  *    props `{ turn, seq, openFile }`; session-scope standard props supply
  *    `useProjection`/`sessionId` (dsh-client-ui-session SessionStandardProps
  *    merges into every session-scoped slot entry). The pre-0.1.7
@@ -17,17 +17,18 @@
  *
  * B) `conversation.view` list entry (id 'skills', order 60, label 技能): a
  *    Skills tab over the whole session — per-skill ledger stats from
- *    `useProjection('skillLedger')` plus capability/quality analysis buttons.
- *    `inputActions` is no longer dispatched to view entries: the two
- *    prompt-writing affordances (re-run hint, deep analysis) copy their
- *    prompt to the clipboard instead.
+ *    `useProjection('skillLedger')`, INLINE per-skill detail (description +
+ *    provider, fetched once per session from `/api/skill-ledger/catalog`),
+ *    plus capability/quality analysis buttons.
+ *    `inputActions` is no longer dispatched to view entries: the deep-analysis
+ *    affordance copies its prompt to the clipboard instead.
  *
  * React hooks are called unconditionally at each component's top (effects run
  * before any early return) — a hard rule this component family enforces
  * after a past hooks-order regression.
  */
 import { createElement, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
-import type { SkillCandidate, SkillLedgerView, SkillStats } from '../types.ts'
+import type { SkillCatalogEntry, SkillLedgerView, SkillStats } from '../types.ts'
 
 const name = 'skill-ledger-client'
 const inject = ['slots']
@@ -84,7 +85,8 @@ const brandBtn: CSSProperties = { fontSize: 11, border: '1px solid var(--dsw-ali
 const statValue: CSSProperties = { fontSize: 20, fontWeight: 700 }
 const statLabel: CSSProperties = { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' }
 const reportBodyStyle: CSSProperties = { marginTop: 6, fontSize: 11, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.6, background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 6, padding: '6px 9px' }
-const rerunBtn: CSSProperties = { borderRadius: 8, border: '1px solid var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-brand-primary)', background: 'transparent', padding: '3px 10px', fontSize: 11, cursor: 'pointer' }
+const skillDescStyle: CSSProperties = { fontSize: 12, lineHeight: 1.65, color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '6px 0 0' }
+const skillMetaStyle: CSSProperties = { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginTop: 4 }
 const summaryChipBtn: CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '1px 7px', borderRadius: 999, background: 'transparent', color: 'var(--dsw-alias-label-tertiary)', border: '1px solid var(--dsw-alias-border-l1)', whiteSpace: 'nowrap', fontSize: 11, lineHeight: 1.4, cursor: 'pointer', fontFamily: 'inherit' }
 const popoverAnchor: CSSProperties = { position: 'relative', display: 'inline-flex', flex: 'none' }
 const popoverStyle: CSSProperties = { position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 30, minWidth: 280, maxWidth: 'min(480px, calc(100vw - 16px))', background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 10, boxShadow: 'var(--dsw-shadow-lv3)', padding: '4px 6px' }
@@ -135,14 +137,6 @@ function turnOfMessageInLedger(raw: unknown, messageId: string | undefined): str
   const ledger = raw && typeof raw === 'object' ? (raw as LedgerWire) : null
   const turn = ledger && ledger.byMessage ? ledger.byMessage[messageId] : undefined
   return typeof turn === 'string' ? turn : undefined
-}
-
-function skillNamesOf(trail: Trail): string[] {
-  const names: string[] = []
-  for (const c of trail.triggered) {
-    if (c.skill !== '' && !names.includes(c.skill)) names.push(c.skill)
-  }
-  return names
 }
 
 /** Hooks-order safety: call useProjection unconditionally with a noop
@@ -219,76 +213,9 @@ function copyPrompt(text: string): void {
   window.prompt('請複製以下提示詞：', text)
 }
 
-/** Pillar B: the non-blocking alternative-skill hint row (own state/effect). */
-function HintRow({ skillNames, sessionId }: { skillNames: string[]; sessionId?: string }): ReactNode {
-  const [cand, setCand] = useState<SkillCandidate[] | null>(null)
-  const [selected, setSelected] = useState<Record<string, boolean>>({})
-  const [copied, setCopied] = useState(false)
-  const skillKey = skillNames.join(',')
-  const prevSkillKey = useRef<string | null>(null)
-  useEffect(() => {
-    if (skillNames.length === 0) {
-      setCand(null)
-      setSelected({})
-      prevSkillKey.current = null
-      return
-    }
-    // Any change of the skill SET (not just to-empty) invalidates stale
-    // selections from a previous turn sharing this component instance.
-    if (prevSkillKey.current !== null && prevSkillKey.current !== skillKey) setSelected({})
-    prevSkillKey.current = skillKey
-    let cancelled = false
-    fetch(`/api/skill-ledger/candidates${typeof sessionId === 'string' && sessionId !== '' ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`)
-      .then((r) => r.json())
-      .then((res: { skills?: SkillCandidate[]; error?: string }) => {
-        if (cancelled) return
-        if (typeof res?.error === 'string' && res.error !== '') {
-          setCand([{ name: `(${res.error})`, description: '' }])
-          return
-        }
-        const arr = Array.isArray(res?.skills) ? res.skills : []
-        setCand(arr.filter((s) => s && typeof s.name === 'string' && !skillNames.includes(s.name)).slice(0, 6))
-      })
-      .catch(() => { if (!cancelled) setCand([]) })
-    return () => { cancelled = true }
-  }, [skillKey, skillNames.length, sessionId])
-
-  // Empty result (fetch settled, nothing applicable): hide the whole row
-  // instead of leaving an orphaned hint label with no chips.
-  if (skillNames.length === 0 || (cand !== null && cand.length === 0)) return null
-  const chosen = Object.keys(selected).filter((k) => selected[k])
-  function rerun(): void {
-    if (chosen.length === 0) return
-    copyPrompt(
-      `請使用技能 ${chosen.join('、')} 重新處理上一輪任務(該輪使用了 ${skillNames.join('、')})。若你對前輪結果有不滿意的具體點,可在此補充說明。`,
-    )
-    setCopied(true)
-    window.setTimeout(() => { setCopied(false) }, 2500)
-  }
-  const list = cand === null ? [] : cand
-  return createElement('div', { style: rowStyle },
-    createElement('span', { style: capStyle }, '不滿意?可試 Alt'),
-    // Candidate chips are real toggle buttons: keyboard focusable, Enter/Space
-    // activatable, and aria-pressed carries the selection state to assistive
-    // tech (a span+onClick would be invisible to both).
-    list.map((s) => createElement('button', {
-      key: s.name,
-      type: 'button',
-      'aria-pressed': selected[s.name] === true,
-      style: {
-        ...chipBase,
-        cursor: 'pointer',
-        fontFamily: 'inherit',
-        borderColor: selected[s.name] ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)',
-        color: selected[s.name] ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)',
-      },
-      title: s.description || '',
-      onClick: () => { setSelected({ ...selected, [s.name]: !selected[s.name] }) },
-    }, (selected[s.name] ? '✓ ' : '') + s.name)),
-    cand === null ? createElement('span', { style: { ...chipBase, opacity: 0.6 } }, '…') : null,
-    chosen.length > 0 ? createElement('button', { style: rerunBtn, onClick: rerun }, copied ? '✓ 已複製提示' : '複製重跑提示') : null,
-  )
-}
+/** Pillar B (removed): the alternative-skill hint row was retired — the
+ * Skills tab now shows inline per-skill detail instead of suggesting
+ * alternates. `copyPrompt` remains for the deep-analysis affordance. */
 
 // ── seat 1: the turnTail list entry ─────────────────────────────────────────
 
@@ -304,10 +231,8 @@ function TurnTail(props: TurnTailProps): ReactNode {
   const ledger = (props.useProjection ?? noopProjection)('skillLedger')
   const entry = trailOfLedger(ledger, turnKey)
   if (!entry) return null
-  const skillNames = skillNamesOf(entry)
   return createElement('div', { style: containerStyle },
     createElement(BadgeRows, { entry }),
-    createElement(HintRow, { skillNames, sessionId: props.sessionId }),
   )
 }
 
@@ -354,7 +279,6 @@ function AssistantActionsBadge(props: AssistantActionsProps): ReactNode {
     // viewport (action rows usually do) so it never falls off-screen.
     createElement('div', { style: { ...popoverStyle, ...(anchorRef.current && typeof anchorRef.current.getBoundingClientRect === 'function' && anchorRef.current.getBoundingClientRect().top > (typeof window !== 'undefined' && window.innerHeight ? window.innerHeight / 2 : 1e9) ? { top: 'auto', bottom: '100%', marginTop: 0, marginBottom: 4 } : {}) } },
       createElement(BadgeRows, { entry }),
-      createElement(HintRow, { skillNames: skillNamesOf(entry), sessionId: props.sessionId }),
     ),
   )
 }
@@ -372,6 +296,32 @@ function SkillsView(props: ViewProps): ReactNode {
   const [reports, setReports] = useState<Record<string, AnalyzeReport>>({})
   const [openSkill, setOpenSkill] = useState('')
   const sid = typeof props.sessionId === 'string' ? props.sessionId : ''
+  // Inline per-skill detail: one live-catalog fetch per session (name →
+  // description/provider). Hooks stay unconditional — effects before any
+  // conditional rendering, per this component family's hooks-order rule.
+  const [catalog, setCatalog] = useState<Record<string, SkillCatalogEntry> | null>(null)
+  useEffect(() => {
+    if (sid === '') return
+    let cancelled = false
+    fetch(`/api/skill-ledger/catalog?sessionId=${encodeURIComponent(sid)}`)
+      .then((r) => r.json())
+      .then((res: { skills?: SkillCatalogEntry[] }) => {
+        if (cancelled) return
+        const map: Record<string, SkillCatalogEntry> = Object.create(null) as Record<string, SkillCatalogEntry>
+        for (const s of Array.isArray(res?.skills) ? res.skills : []) {
+          if (s && typeof s.name === 'string' && s.name !== '') {
+            map[s.name] = {
+              name: s.name,
+              description: typeof s.description === 'string' ? s.description : '',
+              provider: typeof s.provider === 'string' ? s.provider : '',
+            }
+          }
+        }
+        setCatalog(map)
+      })
+      .catch(() => { if (!cancelled) setCatalog(Object.create(null) as Record<string, SkillCatalogEntry>) })
+    return () => { cancelled = true }
+  }, [sid])
   const reg = ledgerRaw && typeof ledgerRaw === 'object' ? ledgerRaw as SkillLedgerView : null
   const total = reg && reg.total && typeof reg.total === 'object' ? reg.total : { skills: 0, calls: 0 }
   const skillsMap = reg && reg.skills && typeof reg.skills === 'object' ? reg.skills : {}
@@ -443,6 +393,16 @@ function SkillsView(props: ViewProps): ReactNode {
         createElement('span', { style: chipErr }, `✗ ${String(rec.err)}`),
         createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, `${rate}%`),
       ),
+      // Inline detail straight from the live catalog — the tab must explain
+      // what each used skill IS, not only how often it ran.
+      createElement('div', { style: skillDescStyle },
+        catalog === null ? '載入技能說明中…'
+          : catalog[skill]
+            ? (catalog[skill]!.description !== '' ? catalog[skill]!.description : '（目錄中該技能沒有描述）')
+            : '（未在當前會話的技能目錄中找到 — 可能來自其他作用域或已被移除）'),
+      catalog !== null && catalog[skill] !== undefined && catalog[skill]!.provider !== ''
+        ? createElement('div', { style: skillMetaStyle }, `來源: ${catalog[skill]!.provider}`)
+        : null,
       createElement('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
         // Expand runs the analysis; collapse does not re-run it.
         createElement('button', {
